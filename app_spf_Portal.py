@@ -223,7 +223,42 @@ auth = stauth.Authenticate(
 )
 
 # Newer streamlit-authenticator API uses keyword 'location'
-name, auth_status, username = auth.login(location="main")
+import inspect
+
+# Try new API first, fall back to older signature; normalize outputs
+name = username = None
+auth_status = None
+
+try:
+    # Prefer newer API (keyword-only 'location', optional 'fields')
+    if "location" in inspect.signature(auth.login).parameters:
+        login_result = auth.login(
+            location="main",
+            fields={"Form name": "Login", "Username": "Username", "Password": "Password"},
+        )
+    else:
+        # Older API: (form_name, location)
+        login_result = auth.login("Login", "main")
+except TypeError:
+    # Some builds throw TypeError if the signature doesn’t match; try legacy form
+    login_result = auth.login("Login", "main")
+
+# Normalize the various return styles across versions
+if isinstance(login_result, tuple):
+    if len(login_result) == 3:
+        name, auth_status, username = login_result
+    elif len(login_result) == 2:
+        auth_status, username = login_result
+        name = username
+else:
+    # Dict-like (just in case a newer version returns a mapping)
+    try:
+        auth_status = login_result.get("authentication_status") or login_result.get("status")
+        username = login_result.get("username")
+        name = login_result.get("name") or username
+    except Exception:
+        pass
+
 
 if auth_status is False:
     st.error('Username/password is incorrect')
