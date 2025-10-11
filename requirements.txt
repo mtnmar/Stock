@@ -1,5 +1,5 @@
 streamlit>=1.37
-streamlit-authenticator>=0.3
+streamlit-authenticator==0.2.3
 pandas>=2.0
 openpyxl>=3.1
 xlsxwriter>=3.2
