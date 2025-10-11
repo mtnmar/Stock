@@ -1,6 +1,6 @@
 # app_spf_portal.py
 # --------------------------------------------------------------
-# Streamlit portal for sanitized Re‑Stock & Outstanding POs
+# Streamlit portal for sanitized Re-Stock & Outstanding POs
 # - Username/password login (streamlit-authenticator)
 # - User → allowed Location(s) mapping
 # - Filter by Location2 (+ quick text filters)
@@ -23,11 +23,11 @@
 from __future__ import annotations
 import os, io, sqlite3, textwrap
 from pathlib import Path
+from collections.abc import Mapping
 import pandas as pd
 import streamlit as st
 import yaml
 
-# Optional: helpful when editing secrets format across versions
 APP_VERSION = "2025.10.11"
 
 try:
@@ -73,6 +73,15 @@ settings:
 
 HERE = Path(__file__).resolve().parent
 
+# ---------- helpers ----------
+def to_plain(obj):
+    """Recursively convert Streamlit Secrets mappings to plain Python dict/list."""
+    if isinstance(obj, Mapping):
+        return {k: to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_plain(x) for x in obj]
+    return obj
+
 # --- DB path resolver ---
 # Priority:
 # 1) settings.db_path from secrets/local YAML
@@ -104,7 +113,6 @@ def resolve_db_path(cfg: dict) -> str:
     # Fallback to local default (works when running on your PC)
     return DEFAULT_DB
 
-
 def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token: str | None = None) -> str:
     """Download a file from a (possibly private) GitHub repo to an app temp path and return its filename.
     Expects secrets['github'] with keys: repo ("owner/name"), path ("data/maintainx_po.db"), branch, token.
@@ -125,13 +133,11 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     out.write_bytes(r.content)
     return str(out)
 
-
 # -------- Config loader (supports TOML secrets, YAML, or template) --------
-
 def load_config() -> dict:
     # 1) Prefer native TOML sections from Streamlit Secrets (no YAML parsing)
     if "app_config" in st.secrets:
-        return dict(st.secrets["app_config"])  # copy to plain dict
+        return to_plain(st.secrets["app_config"])  # convert to plain dict
 
     # 2) Back-compat: allow a YAML string in secrets if present
     if "app_config_yaml" in st.secrets:
@@ -153,26 +159,21 @@ def load_config() -> dict:
     # 4) Built-in template fallback
     return yaml.safe_load(CONFIG_TEMPLATE_YAML)
 
-
 # -------- Small DB helpers --------
-
 def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
     path = db_path or DEFAULT_DB
     with sqlite3.connect(path) as conn:
         return pd.read_sql_query(sql, conn, params=params)
-
 
 def view_exists(view_name: str, db_path: str) -> bool:
     with sqlite3.connect(db_path) as conn:
         cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='view' AND name=?", (view_name,))
         return cur.fetchone() is not None
 
-
 def table_exists(table_name: str, db_path: str) -> bool:
     with sqlite3.connect(db_path) as conn:
         cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
         return cur.fetchone() is not None
-
 
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter  # ensure engine available
@@ -186,7 +187,6 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
             width = min(60, max(10, int(df[col].astype(str).str.len().quantile(0.9)) + 2))
             ws.set_column(i, i, width)
     return buf.getvalue()
-
 
 def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc = Document()
@@ -208,10 +208,10 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.save(out)
     return out.getvalue()
 
-
 # ---------- App ----------
 st.sidebar.caption(f"SPF PO Portal — v{APP_VERSION}")
 cfg = load_config()
+cfg = to_plain(cfg)  # ensure plain dicts (Authenticator mutates credentials)
 
 # Build authenticator
 cookie_cfg = cfg.get('cookie', {})
