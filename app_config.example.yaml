@@ -1,0 +1,30 @@
+# app_config.yaml — place next to app_spf_portal.py (DON'T COMMIT REAL SECRETS)
+# Copy this to app_config.yaml and replace the placeholders.
+credentials:
+  usernames:
+    brad:
+      name: Brad
+      email: brad@example.com
+      # Replace with a bcrypt hash (see hash_passwords.py). Do NOT use plain text.
+      password: "<bcrypt-hash-here>"
+    demo:
+      name: Demo User
+      email: demo@example.com
+      # bcrypt for password 'demo' (example; replace in real file)
+      password: "$2b$12$d9r3v4j3K2o2uI6dFoyVbOa3YV1Aq8p2qTj6kQy0iv8y2dQk6gV2W"
+
+cookie:
+  name: spf_po_portal
+  key: change_me_in_yaml
+  expiry_days: 7
+
+access:
+  admin_usernames: [brad]
+  # Map usernames to allowed Location2 codes. '*' means all locations.
+  user_locations:
+    brad: ['*']
+    demo: ['*']
+
+settings:
+  # If left blank, the app will use the hard-coded default path in the code.
+  db_path: ""
