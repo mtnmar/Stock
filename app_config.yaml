@@ -6,7 +6,7 @@ credentials:
       name: Brad
       email: brad@example.com
       # Replace with a bcrypt hash (see hash_passwords.py). Do NOT use plain text.
-      password: "$2b$12$4FKEUztNcpOnx9I8IODgZ.smGWS/MLOKUnZBBBhd5oLd7hSPbryDa"
+      password: "$2b$12$.n87oFQoP03GYkzoQUFGr.Ni0csX626Q7FhUuEmVNH4GniOwW9TBe"
     demo:
       name: Demo User
       email: demo@example.com
