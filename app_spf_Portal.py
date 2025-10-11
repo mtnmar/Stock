@@ -6,15 +6,19 @@
 # - Filter by Location2 (+ quick text filters)
 # - Display table
 # - Download as Excel (.xlsx) or Word (.docx with gridlines)
-# - Reads from SQLite created by your converter:
-#     C:\\Users\\Brad\\Desktop\\XRefApp\\data\\maintainx_po.db
+# - Fetches SQLite DB from:
+#     1) app secrets [github] (private repo download)
+#     2) settings.db_path (from secrets or local YAML)
+#     3) SPF_DB_PATH env var
+#     4) DEFAULT_DB fallback (for local dev)
 #
-# How to run:
+# How to run (locally):
 #   pip install -r requirements.txt
 #   streamlit run app_spf_portal.py
 #
-# Optional config: create app_config.yaml alongside this file to override
-# users, passwords, and DB path. See CONFIG_TEMPLATE_YAML below.
+# Deploy on Streamlit Cloud:
+#   - Push this file + requirements.txt to your repo
+#   - In Cloud → Settings → Secrets, add TOML blocks for [app_config] and [github]
 
 from __future__ import annotations
 import os, io, sqlite3, textwrap
@@ -23,30 +27,34 @@ import pandas as pd
 import streamlit as st
 import yaml
 
+# Optional: helpful when editing secrets format across versions
+APP_VERSION = "2025.10.11"
+
 try:
     import streamlit_authenticator as stauth
 except Exception:
-    st.warning("streamlit-authenticator not installed. Run: pip install streamlit-authenticator")
+    st.warning("streamlit-authenticator not installed. Add to requirements.txt")
     st.stop()
 
 try:
     from docx import Document
     from docx.shared import Pt
 except Exception:
-    st.warning("python-docx not installed. Run: pip install python-docx")
+    st.warning("python-docx not installed. Add to requirements.txt")
     st.stop()
 
 st.set_page_config(page_title="SPF PO Portal", page_icon="📦", layout="wide")
 
 # ---------- Defaults & config ----------
-DEFAULT_DB = r"C:\\Users\\Brad\\Desktop\\XRefApp\\data\\maintainx_po.db"
+# Local-only fallback; Streamlit Cloud will use secrets → GitHub download
+DEFAULT_DB = "maintainx_po.db"
+
 CONFIG_TEMPLATE_YAML = """
 credentials:
   usernames:
     demo:
       name: Demo User
       email: demo@example.com
-      # bcrypt hash for password 'demo'
       password: "$2b$12$y2J3Y0rRrJ3fA76h2o//mO6F1T0m3b1vS7QhQ4bW5iX9b5b5b5b5e"
 
 cookie:
@@ -60,20 +68,20 @@ access:
     demo: ['*']  # '*' means all locations
 
 settings:
-  db_path: ""  # leave blank to use DEFAULT_DB
+  db_path: ""  # leave blank to use DEFAULT_DB (or secrets→GitHub on Cloud)
 """
 
 HERE = Path(__file__).resolve().parent
 
 # --- DB path resolver ---
 # Priority:
-# 1) settings.db_path from YAML (st.secrets['app_config_yaml'] or local app_config.yaml)
+# 1) settings.db_path from secrets/local YAML
 # 2) env var SPF_DB_PATH
-# 3) GitHub private repo download via st.secrets['github'] (repo, path, branch, token)
+# 3) GitHub private repo download via secrets['github'] (repo, path, branch, token)
 # If #3, we fetch to a temp file and return its local path.
 
 def resolve_db_path(cfg: dict) -> str:
-    # 1) YAML-configured path
+    # 1) YAML/secrets-configured path
     yaml_db = (cfg or {}).get('settings', {}).get('db_path')
     if yaml_db:
         return yaml_db
@@ -99,12 +107,11 @@ def resolve_db_path(cfg: dict) -> str:
 
 def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token: str | None = None) -> str:
     """Download a file from a (possibly private) GitHub repo to an app temp path and return its filename.
-    Expects st.secrets['github'] with keys: repo ("owner/name"), path ("data/maintainx_po.db"), branch, token.
+    Expects secrets['github'] with keys: repo ("owner/name"), path ("data/maintainx_po.db"), branch, token.
     """
     if not repo or not path:
         raise ValueError("Missing repo/path for GitHub download.")
     import requests, tempfile
-    # Use GitHub API to support private repos
     url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
     headers = {"Accept": "application/vnd.github.v3.raw"}
     if token:
@@ -112,7 +119,6 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     r = requests.get(url, headers=headers, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
-    # Save to a temp file within the Streamlit runtime
     tmpdir = Path(tempfile.gettempdir()) / "spf_po_cache"
     tmpdir.mkdir(parents=True, exist_ok=True)
     out = tmpdir / "maintainx_po.db"
@@ -120,18 +126,35 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     return str(out)
 
 
-def load_config() -> dict:
-    # Priority: Streamlit secrets → app_config.yaml → built-in template
-    if "app_config_yaml" in st.secrets:
-        cfg = yaml.safe_load(st.secrets["app_config_yaml"]) or {}
-    else:
-        cfg_file = HERE / "app_config.yaml"
-        if cfg_file.exists():
-            cfg = yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
-        else:
-            cfg = yaml.safe_load(CONFIG_TEMPLATE_YAML)
-    return cfg
+# -------- Config loader (supports TOML secrets, YAML, or template) --------
 
+def load_config() -> dict:
+    # 1) Prefer native TOML sections from Streamlit Secrets (no YAML parsing)
+    if "app_config" in st.secrets:
+        return dict(st.secrets["app_config"])  # copy to plain dict
+
+    # 2) Back-compat: allow a YAML string in secrets if present
+    if "app_config_yaml" in st.secrets:
+        try:
+            return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
+        except Exception as e:
+            st.error(f"Invalid YAML in app_config_yaml secret: {e}")
+            return {}
+
+    # 3) Local file (useful when running on your PC)
+    cfg_file = HERE / "app_config.yaml"
+    if cfg_file.exists():
+        try:
+            return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            st.error(f"Invalid YAML in local app_config.yaml: {e}")
+            return {}
+
+    # 4) Built-in template fallback
+    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
+
+
+# -------- Small DB helpers --------
 
 def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
     path = db_path or DEFAULT_DB
@@ -157,7 +180,7 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
         df.to_excel(w, index=False, sheet_name=sheet)
         ws = w.sheets[sheet]
-        ws.autofilter(0, 0, max(0,len(df)), max(0,len(df.columns)-1))
+        ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
         # Auto-widths
         for i, col in enumerate(df.columns):
             width = min(60, max(10, int(df[col].astype(str).str.len().quantile(0.9)) + 2))
@@ -187,17 +210,20 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
 
 
 # ---------- App ----------
+st.sidebar.caption(f"SPF PO Portal — v{APP_VERSION}")
 cfg = load_config()
+
+# Build authenticator
+cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
-    cfg.get('cookie', {}).get('name', 'spf_po_cookie'),
-    cfg.get('cookie', {}).get('key', 'change_me'),
-    cfg.get('cookie', {}).get('expiry_days', 7),
+    cookie_cfg.get('name', 'spf_po_cookie'),
+    cookie_cfg.get('key', 'change_me'),
+    cookie_cfg.get('expiry_days', 7),
 )
 
-# works on current streamlit-authenticator releases
+# Newer streamlit-authenticator API uses keyword 'location'
 name, auth_status, username = auth.login(location="main")
-
 
 if auth_status is False:
     st.error('Username/password is incorrect')
@@ -213,11 +239,11 @@ else:
         st.cache_data.clear()
 
     # Choose dataset
-    ds = st.sidebar.radio('Dataset', ['RE-STOCK', "Outstanding POs"], index=0)
+    ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
 
     # Access control: which locations can this user see?
     user_locs = cfg.get('access', {}).get('user_locations', {}).get(username, ['*'])
-    is_admin = username in cfg.get('access', {}).get('admin_usernames', [])
+    # is_admin = username in cfg.get('access', {}).get('admin_usernames', [])  # reserved for future use
 
     # Determine source view/table and available locations
     if ds == 'RE-STOCK':
