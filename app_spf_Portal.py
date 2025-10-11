@@ -11,14 +11,6 @@
 #     2) settings.db_path (from secrets or local YAML)
 #     3) SPF_DB_PATH env var
 #     4) DEFAULT_DB fallback (for local dev)
-#
-# How to run (locally):
-#   pip install -r requirements.txt
-#   streamlit run app_spf_portal.py
-#
-# Deploy on Streamlit Cloud:
-#   - Push this file + requirements.txt to your repo
-#   - In Cloud → Settings → Secrets, add TOML blocks for [app_config] and [github]
 
 from __future__ import annotations
 import os, io, sqlite3, textwrap
@@ -46,8 +38,7 @@ except Exception:
 st.set_page_config(page_title="SPF PO Portal", page_icon="📦", layout="wide")
 
 # ---------- Defaults & config ----------
-# Local-only fallback; Streamlit Cloud will use secrets → GitHub download
-DEFAULT_DB = "maintainx_po.db"
+DEFAULT_DB = "maintainx_po.db"  # local-only fallback; Cloud uses secrets→GitHub
 
 CONFIG_TEMPLATE_YAML = """
 credentials:
@@ -65,10 +56,10 @@ cookie:
 access:
   admin_usernames: [demo]
   user_locations:
-    demo: ['*']  # '*' means all locations
+    demo: ['*']
 
 settings:
-  db_path: ""  # leave blank to use DEFAULT_DB (or secrets→GitHub on Cloud)
+  db_path: ""
 """
 
 HERE = Path(__file__).resolve().parent
@@ -81,13 +72,6 @@ def to_plain(obj):
     if isinstance(obj, (list, tuple)):
         return [to_plain(x) for x in obj]
     return obj
-
-# --- DB path resolver ---
-# Priority:
-# 1) settings.db_path from secrets/local YAML
-# 2) env var SPF_DB_PATH
-# 3) GitHub private repo download via secrets['github'] (repo, path, branch, token)
-# If #3, we fetch to a temp file and return its local path.
 
 def resolve_db_path(cfg: dict) -> str:
     # 1) YAML/secrets-configured path
@@ -114,9 +98,7 @@ def resolve_db_path(cfg: dict) -> str:
     return DEFAULT_DB
 
 def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token: str | None = None) -> str:
-    """Download a file from a (possibly private) GitHub repo to an app temp path and return its filename.
-    Expects secrets['github'] with keys: repo ("owner/name"), path ("data/maintainx_po.db"), branch, token.
-    """
+    """Download a file from a (possibly private) GitHub repo to a temp path and return its filename."""
     if not repo or not path:
         raise ValueError("Missing repo/path for GitHub download.")
     import requests, tempfile
@@ -133,7 +115,6 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     out.write_bytes(r.content)
     return str(out)
 
-# -------- Config loader (supports TOML secrets, YAML, or template) --------
 def load_config() -> dict:
     # 1) Prefer native TOML sections from Streamlit Secrets (no YAML parsing)
     if "app_config" in st.secrets:
@@ -222,41 +203,9 @@ auth = stauth.Authenticate(
     cookie_cfg.get('expiry_days', 7),
 )
 
-# Newer streamlit-authenticator API uses keyword 'location'
-import inspect
-
-# Version-proof login: try new API, fall back to old; normalize outputs
-name = username = None
-auth_status = None
-
-try:
-    if "location" in inspect.signature(auth.login).parameters:
-        login_result = auth.login(
-            location="main",
-            fields={"Form name": "Login", "Username": "Username", "Password": "Password"},
-        )
-    else:
-        login_result = auth.login("Login", "main")
-except TypeError:
-    # If signature mismatch, use legacy call
-    login_result = auth.login("Login", "main")
-
-# Normalize return shape
-if isinstance(login_result, tuple):
-    if len(login_result) == 3:
-        name, auth_status, username = login_result
-    elif len(login_result) == 2:
-        auth_status, username = login_result
-        name = username
-else:
-    try:
-        auth_status = login_result.get("authentication_status") or login_result.get("status")
-        username = login_result.get("username")
-        name = login_result.get("name") or username
-    except Exception:
-        pass
-
-
+# *** PIN TO streamlit-authenticator==0.2.3 ***
+# Simple, stable login call for 0.2.x:
+name, auth_status, username = auth.login("Login", "main")
 
 if auth_status is False:
     st.error('Username/password is incorrect')
@@ -276,7 +225,6 @@ else:
 
     # Access control: which locations can this user see?
     user_locs = cfg.get('access', {}).get('user_locations', {}).get(username, ['*'])
-    # is_admin = username in cfg.get('access', {}).get('admin_usernames', [])  # reserved for future use
 
     # Determine source view/table and available locations
     if ds == 'RE-STOCK':
@@ -297,7 +245,7 @@ else:
     if '*' in user_locs:
         selectable = all_locs
     else:
-        selectable = [x for x in all_locs if x in user_locs] or all_locs  # fallback to all if mapping is stale
+        selectable = [x for x in all_locs if x in user_locs] or all_locs
 
     # Simple ALL toggle + optional multi-select
     all_toggle = st.sidebar.checkbox('All locations', value=True)
@@ -358,4 +306,5 @@ else:
     with st.expander('ℹ️ Info / Help'):
         st.write("Source:", src)
         st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
