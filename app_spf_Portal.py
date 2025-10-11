@@ -195,7 +195,9 @@ auth = stauth.Authenticate(
     cfg.get('cookie', {}).get('expiry_days', 7),
 )
 
-name, auth_status, username = auth.login('Login', 'main')
+# works on current streamlit-authenticator releases
+name, auth_status, username = auth.login(location="main")
+
 
 if auth_status is False:
     st.error('Username/password is incorrect')
