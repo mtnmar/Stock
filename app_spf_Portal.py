@@ -194,14 +194,15 @@ st.sidebar.caption(f"SPF PO Portal — v{APP_VERSION}")
 cfg = load_config()
 cfg = to_plain(cfg)  # ensure plain dicts (Authenticator mutates credentials)
 
-# Build authenticator
+# Build authenticator (use a NEW cookie name/key to avoid stale cookies)
 cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
-    cookie_cfg.get('name', 'spf_po_cookie'),
-    cookie_cfg.get('key', 'change_me'),
+    cookie_cfg.get('name', 'spf_po_cookie_v2'),   # <-- new name
+    cookie_cfg.get('key',  'super_secret_key_v2'),# <-- new key
     cookie_cfg.get('expiry_days', 7),
 )
+
 
 # *** PIN TO streamlit-authenticator==0.2.3 ***
 # Simple, stable login call for 0.2.x:
