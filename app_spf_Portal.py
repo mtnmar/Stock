@@ -199,7 +199,7 @@ def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
                 headers["Authorization"] = f"token {gh['token']}"
             r = requests.get(url, headers=headers, params=params, timeout=20)
             r.raise_for_status()
-            iso = r.json()[0]["commit"]["committer"]["date"]  # e.g., '2025-10-11T21:07:33Z'
+            iso = r.json()[0]["commit"]["committer"]["date"]
             dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
             return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
         except Exception:
@@ -319,11 +319,30 @@ else:
         chosen_companies = [chosen]
         title_companies = chosen
 
-    # UI: search per dataset (only on existing columns)
+    # --- Determine available columns now (so we can build a correct search clause)
+    cols_in_db = table_columns_in_order(db_path, src)
+    cols_lower = {c.lower(): c for c in cols_in_db}
+
+    # UI: search per dataset (now RE-STOCK supports Vendor/Vendors)
     if ds == 'RE-STOCK':
-        search = st.sidebar.text_input('Search Part Numbers / Name contains')
-        search_clause = "([Part Numbers] LIKE ? OR [Name] LIKE ?)"
-        search_fields = 2
+        # pick Vendors or Vendor if present
+        vendor_col = None
+        if 'vendors' in cols_lower:
+            vendor_col = cols_lower['vendors']
+        elif 'vendor' in cols_lower:
+            vendor_col = cols_lower['vendor']
+
+        # Dynamic label + SQL where
+        label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
+        search = st.sidebar.text_input(label)
+
+        if vendor_col:
+            search_clause = f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)"
+            search_fields = 3
+        else:
+            search_clause = "([Part Numbers] LIKE ? OR [Name] LIKE ?)"
+            search_fields = 2
+
         order_by = "[Company], [Name]"
     else:
         search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
@@ -374,6 +393,7 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
