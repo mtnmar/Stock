@@ -211,37 +211,51 @@ else:
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company (lenient matching, required selection, admin-only All) ---
-    all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1", db_path=db_path)
+    # --- Authorization by Company (case-insensitive username lookup + lenient company matching) ---
+    all_companies_df = q(
+        f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
+        db_path=db_path
+    )
     all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
-    admin_users = (cfg.get('access', {}).get('admin_usernames', []) or [])
-    is_admin = username in admin_users
+    # Case-insensitive username handling
+    username_ci = str(username).casefold()
+    admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
+    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
+    is_admin = username_ci in admin_users_ci
 
-    allowed_cfg = cfg.get('access', {}).get('user_companies', {}).get(username, [])
+    # Case-insensitive lookup of user_companies
+    uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
+    uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
+    allowed_cfg = uc_ci_map.get(username_ci, [])
     if isinstance(allowed_cfg, str):
         allowed_cfg = [allowed_cfg]
     allowed_cfg = [a for a in (allowed_cfg or [])]
 
     def norm(s: str) -> str:
-        # trim, collapse inner spaces, casefold for case-insensitive compare
+        # trim, collapse inner spaces, casefold for compare
         return " ".join(str(s).strip().split()).casefold()
 
-    db_map = {norm(c): c for c in all_companies}         # normalized -> original
+    # Build normalization map for DB company strings
+    db_map = {norm(c): c for c in all_companies}         # normalized -> DB original
     allowed_norm = {norm(a) for a in allowed_cfg}
-    star_granted = any(a.strip() == "*" for a in allowed_cfg)
+    star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
 
     if is_admin or star_granted:
+        # Admins (or '*') see everything in the dataset
         allowed_set = set(all_companies)
     else:
-        # only companies that exist in DB (after normalization)
-        allowed_set = {db_map[n] for n in allowed_norm if n in db_map}
+        # Prefer matches that actually exist in the dataset
+        matches = {db_map[n] for n in allowed_norm if n in db_map}
+        if matches:
+            allowed_set = matches
+        else:
+            # If none of the configured companies exist in this dataset now,
+            # still show the configured names; selection may yield 0 rows.
+            allowed_set = set(allowed_cfg)
 
     if not allowed_set:
-        st.error(
-            "You don’t have access to any companies for this dataset. "
-            "Ask an admin to update your company list to match the exact strings in the database."
-        )
+        st.error("No companies configured for your account. Ask an admin to update your access.")
         with st.expander("Company values present in DB"):
             st.write(sorted(all_companies))
         st.stop()
@@ -249,22 +263,20 @@ else:
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
 
-    # Dropdown: no default selection (like your dataset radio, but starts blank)
+    # Dropdown: required choice (no default). Admins get an "All" option.
     select_options = ["— Choose company —"]
-    if is_admin and len(company_options) > 1:
+    if is_admin and len(all_companies) > 1:
         select_options += [ADMIN_ALL]
     select_options += company_options
 
     chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=0)
 
-    # Gate: stop until a real choice is made
     if chosen == "— Choose company —":
         st.info("Select your Company on the left to load data.")
         st.stop()
 
-    # Derive chosen_companies for the query and title text
     if is_admin and chosen == ADMIN_ALL:
-        chosen_companies = company_options[:]  # all allowed for admin
+        chosen_companies = sorted(all_companies)
         title_companies = "All companies (admin)"
     else:
         chosen_companies = [chosen]
@@ -323,6 +335,7 @@ else:
 
     with st.expander('ℹ️ Config template'):
         st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
