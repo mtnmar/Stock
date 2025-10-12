@@ -211,7 +211,7 @@ else:
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company (STRICT) & required selection ---
+    # --- Authorization by Company (lenient matching, required selection, admin-only All) ---
     all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1", db_path=db_path)
     all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
@@ -221,25 +221,35 @@ else:
     allowed_cfg = cfg.get('access', {}).get('user_companies', {}).get(username, [])
     if isinstance(allowed_cfg, str):
         allowed_cfg = [allowed_cfg]
-    allowed_cfg = [a.strip() for a in (allowed_cfg or [])]
+    allowed_cfg = [a for a in (allowed_cfg or [])]
 
-    # Admins get access to everything; others must match exact strings
-    if is_admin or "*" in allowed_cfg:
+    def norm(s: str) -> str:
+        # trim, collapse inner spaces, casefold for case-insensitive compare
+        return " ".join(str(s).strip().split()).casefold()
+
+    db_map = {norm(c): c for c in all_companies}         # normalized -> original
+    allowed_norm = {norm(a) for a in allowed_cfg}
+    star_granted = any(a.strip() == "*" for a in allowed_cfg)
+
+    if is_admin or star_granted:
         allowed_set = set(all_companies)
     else:
-        allowed_set = {c for c in all_companies if c in set(allowed_cfg)}
+        # only companies that exist in DB (after normalization)
+        allowed_set = {db_map[n] for n in allowed_norm if n in db_map}
 
     if not allowed_set:
         st.error(
-            "You don’t have access to any companies (or the names don’t match the DB exactly). "
-            "An admin should update your company list in Secrets to match the exact strings in the database."
+            "You don’t have access to any companies for this dataset. "
+            "Ask an admin to update your company list to match the exact strings in the database."
         )
+        with st.expander("Company values present in DB"):
+            st.write(sorted(all_companies))
         st.stop()
 
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
 
-    # Dropdown: no default selection
+    # Dropdown: no default selection (like your dataset radio, but starts blank)
     select_options = ["— Choose company —"]
     if is_admin and len(company_options) > 1:
         select_options += [ADMIN_ALL]
