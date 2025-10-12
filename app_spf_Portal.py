@@ -2,7 +2,7 @@
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK and Outstanding POs
 # - Login (streamlit-authenticator)
-# - Filter & authorize by Company (not Location)
+# - Authorize & filter by Company (not Location)
 # - Uses raw tables: restock, po_outstanding (no views)
 # - Preserves exact DB column order in grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
@@ -207,32 +207,58 @@ else:
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
 
-    # Dataset -> table name
+    # Dataset -> table name (radio)
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company ---
+    # --- Authorization by Company (STRICT) & required selection ---
     all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1", db_path=db_path)
-    all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or ["(none)"]
+    all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
-    allowed = cfg.get('access', {}).get('user_companies', {}).get(username, ['*'])
-    if '*' in allowed:
-        allowed_companies = set(all_companies)
-    else:
-        allowed_companies = {c for c in all_companies if c in set(allowed)}
-        if not allowed_companies:
-            # Fallback: prevent lockout if mapping stale
-            allowed_companies = set(all_companies)
+    admin_users = (cfg.get('access', {}).get('admin_usernames', []) or [])
+    is_admin = username in admin_users
 
-    # UI: Company filter (limited to allowed set)
-    allowed_sorted = sorted(allowed_companies)
-    all_toggle = st.sidebar.checkbox('All companies', value=True)
-    if all_toggle:
-        chosen_companies = allowed_sorted
+    allowed_cfg = cfg.get('access', {}).get('user_companies', {}).get(username, [])
+    if isinstance(allowed_cfg, str):
+        allowed_cfg = [allowed_cfg]
+    allowed_cfg = [a.strip() for a in (allowed_cfg or [])]
+
+    # Admins get access to everything; others must match exact strings
+    if is_admin or "*" in allowed_cfg:
+        allowed_set = set(all_companies)
     else:
-        chosen_companies = st.sidebar.multiselect('Company(ies)', options=allowed_sorted, default=allowed_sorted)
-        if not chosen_companies:
-            chosen_companies = allowed_sorted
+        allowed_set = {c for c in all_companies if c in set(allowed_cfg)}
+
+    if not allowed_set:
+        st.error(
+            "You don’t have access to any companies (or the names don’t match the DB exactly). "
+            "An admin should update your company list in Secrets to match the exact strings in the database."
+        )
+        st.stop()
+
+    company_options = sorted(allowed_set)
+    ADMIN_ALL = "« All companies (admin) »"
+
+    # Dropdown: no default selection
+    select_options = ["— Choose company —"]
+    if is_admin and len(company_options) > 1:
+        select_options += [ADMIN_ALL]
+    select_options += company_options
+
+    chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=0)
+
+    # Gate: stop until a real choice is made
+    if chosen == "— Choose company —":
+        st.info("Select your Company on the left to load data.")
+        st.stop()
+
+    # Derive chosen_companies for the query and title text
+    if is_admin and chosen == ADMIN_ALL:
+        chosen_companies = company_options[:]  # all allowed for admin
+        title_companies = "All companies (admin)"
+    else:
+        chosen_companies = [chosen]
+        title_companies = chosen
 
     # UI: search per dataset (only on existing columns)
     if ds == 'RE-STOCK':
@@ -246,7 +272,7 @@ else:
         search_fields = 4
         order_by = "[Company], date([Created On]) ASC, [Purchase Order #]"
 
-    # Build WHERE
+    # Build WHERE (Company required)
     ph = ','.join(['?'] * len(chosen_companies))
     where = [f"[Company] IN ({ph})"]
     params: list = list(chosen_companies)
@@ -265,9 +291,6 @@ else:
     df = df[[c for c in cols_in_order if c in df.columns]]
 
     # Title & grid
-    title_companies = 'All companies' if set(chosen_companies) == set(allowed_sorted) else (
-        ', '.join(chosen_companies) if len(chosen_companies) <= 5 else f'{len(chosen_companies)} companies'
-    )
     st.markdown(f"### {ds} — {title_companies}")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -290,6 +313,7 @@ else:
 
     with st.expander('ℹ️ Config template'):
         st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
