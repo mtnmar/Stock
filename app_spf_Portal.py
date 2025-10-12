@@ -21,6 +21,7 @@ from __future__ import annotations
 import os, io, sqlite3, textwrap
 from pathlib import Path
 from collections.abc import Mapping
+from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 import yaml
@@ -148,6 +149,7 @@ def table_columns_in_order(db_path: str, table: str) -> list[str]:
         rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
     return [r[1] for r in rows]  # PRAGMA preserves on-disk order
 
+# ---- SAFE Excel export (works even when df is empty) ----
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
     buf = io.BytesIO()
@@ -156,7 +158,13 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
         ws = w.sheets[sheet]
         ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
         for i, col in enumerate(df.columns):
-            width = min(60, max(10, int(df[col].astype(str).str.len().quantile(0.9)) + 2))
+            if df.empty:
+                width = 12
+            else:
+                lens = df[col].astype(str).str.len()
+                q = lens.quantile(0.9) if not lens.empty else 10
+                q = 10 if pd.isna(q) else q
+                width = min(60, max(10, int(q) + 2))
             ws.set_column(i, i, width)
     return buf.getvalue()
 
@@ -178,8 +186,32 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.save(out)
     return out.getvalue()
 
+# ---- "Data last updated" helper (GitHub commit time or local mtime) ----
+def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
+    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
+    if gh and gh.get('repo') and gh.get('path'):
+        try:
+            import requests
+            url = f"https://api.github.com/repos/{gh['repo']}/commits"
+            params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
+            headers = {"Accept": "application/vnd.github+json"}
+            if gh.get("token"):
+                headers["Authorization"] = f"token {gh['token']}"
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            iso = r.json()[0]["commit"]["committer"]["date"]  # e.g., '2025-10-11T21:07:33Z'
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+            return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
+    try:
+        ts = Path(db_path).stat().st_mtime
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
+    except Exception:
+        return None
+
 # ---------- App ----------
-st.sidebar.caption(f"SPF PO Portal — v{APP_VERSION}")
 cfg = load_config()
 cfg = to_plain(cfg)  # ensure plain dicts
 
@@ -203,7 +235,12 @@ else:
     st.sidebar.success(f"Logged in as {name}")
 
     db_path = resolve_db_path(cfg)
-    st.sidebar.caption(f"DB: {db_path}")
+
+    # Sidebar caption: only the "last updated" info (no DB path, no version)
+    updated_label = get_data_last_updated(cfg, db_path)
+    if updated_label:
+        st.sidebar.caption(updated_label)
+
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
 
@@ -333,8 +370,11 @@ else:
             mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
 
-    with st.expander('ℹ️ Config template'):
-        st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+    # Only admins see the config template
+    if is_admin:
+        with st.expander('ℹ️ Config template'):
+            st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
