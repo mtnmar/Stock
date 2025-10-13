@@ -5,6 +5,8 @@
 # - Authorize & filter by Company (not Location)
 # - Uses raw tables: restock, po_outstanding (no views)
 # - Preserves exact DB column order in grid & downloads
+# - Dates shown as YYYY-MM-DD (no time)
+# - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
 #
 # requirements.txt (minimum):
@@ -26,7 +28,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.11"
+APP_VERSION = "2025.10.13"
 
 # ---- deps ----
 try:
@@ -186,6 +188,34 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.save(out)
     return out.getvalue()
 
+# ---- Date + column helpers ----
+def strip_time(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Format any datetime-ish column as YYYY-MM-DD strings (keeps blanks as-is)."""
+    for c in cols:
+        if c in df.columns:
+            s = pd.to_datetime(df[c], errors="coerce")
+            df[c] = s.dt.strftime("%Y-%m-%d").where(~s.isna(), df[c])
+    return df
+
+# Date columns to format (applied only if they exist)
+DATE_COLS = {
+    "restock": [
+        "Created On", "Approved On", "Completed On",
+        "Part Updated on", "Posting Date",
+        "Needed By", "Needed by", "Last updated", "Last Updated"
+    ],
+    "po_outstanding": [
+        "Created On", "Approved On", "Completed On",
+        "Part Updated on", "Posting Date"
+    ],
+}
+
+# Columns to hide from grid & downloads
+HIDE_COLS = {
+    "restock": ["ID", "id", "Purchase Order ID"],
+    "po_outstanding": ["ID", "id", "Purchase Order ID", "Column2"],
+}
+
 # ---- "Data last updated" helper (GitHub commit time or local mtime) ----
 def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
     gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
@@ -325,14 +355,12 @@ else:
 
     # UI: search per dataset (now RE-STOCK supports Vendor/Vendors)
     if ds == 'RE-STOCK':
-        # pick Vendors or Vendor if present
         vendor_col = None
         if 'vendors' in cols_lower:
             vendor_col = cols_lower['vendors']
         elif 'vendor' in cols_lower:
             vendor_col = cols_lower['vendor']
 
-        # Dynamic label + SQL where
         label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
         search = st.sidebar.text_input(label)
 
@@ -364,9 +392,14 @@ else:
     sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY {order_by}"
     df = q(sql, tuple(params), db_path=db_path)
 
-    # Preserve on-disk table column order
+    # Date-only formatting for known date columns
+    df = strip_time(df, DATE_COLS.get(src, []))
+
+    # Preserve on-disk order but hide IDs/technical columns
     cols_in_order = table_columns_in_order(db_path, src)
-    df = df[[c for c in cols_in_order if c in df.columns]]
+    hide_set = set(HIDE_COLS.get(src, []))
+    cols_in_order = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
+    df = df[cols_in_order]
 
     # Title & grid
     st.markdown(f"### {ds} — {title_companies}")
@@ -393,6 +426,7 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
