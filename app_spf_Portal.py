@@ -691,8 +691,11 @@ else:
             st.rerun()  # clear now
 
         # ---------- Standard downloads (EXCEL matches VISIBLE columns) ----------
-        # Excel uses the edited grid (includes the "Select" checkbox column)
-        excel_df = edited.copy()
+        # Excel matches the visible table BUT replaces the checkbox with a blank checklist column
+        excel_df = df_display.drop(columns=["Select"], errors="ignore").copy()
+        # Add a blank column users can mark in Excel
+        excel_df.insert(0, "Inventory Check", "")
+
 
         # Word keeps the original download column set (as before)
         df_download = df[cols_for_download]
