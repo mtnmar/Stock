@@ -8,6 +8,10 @@
 # - Dates shown as YYYY-MM-DD (no time)
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
+# - NEW: Grid hides Rsvd/Ord/Company, has Select checkboxes
+# - NEW: Generate Quote Requests:
+#        • One Word per Vendor (ZIP)
+#        • One combined Word for all selected rows
 #
 # requirements.txt (minimum):
 #   streamlit>=1.37
@@ -20,15 +24,16 @@
 #   requests>=2.31
 
 from __future__ import annotations
-import os, io, sqlite3, textwrap
+import os, io, sqlite3, textwrap, re, zipfile
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from typing import Optional, Iterable
 import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.13"
+APP_VERSION = "2025.10.17"
 
 # ---- deps ----
 try:
@@ -75,7 +80,6 @@ HERE = Path(__file__).resolve().parent
 
 # ---------- helpers ----------
 def to_plain(obj):
-    """Recursively convert Secrets to plain Python structures."""
     if isinstance(obj, Mapping):
         return {k: to_plain(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -83,15 +87,12 @@ def to_plain(obj):
     return obj
 
 def resolve_db_path(cfg: dict) -> str:
-    # 1) YAML/secrets-configured path
     yaml_db = (cfg or {}).get('settings', {}).get('db_path')
     if yaml_db:
         return yaml_db
-    # 2) SPF_DB_PATH env
     env_db = os.environ.get('SPF_DB_PATH')
     if env_db:
         return env_db
-    # 3) Secrets → GitHub download (supports private repo)
     gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
     if gh:
         try:
@@ -103,7 +104,6 @@ def resolve_db_path(cfg: dict) -> str:
             )
         except Exception as e:
             st.error(f"Failed to download DB from GitHub: {e}")
-    # 4) Fallback local
     return DEFAULT_DB
 
 def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token: str | None = None) -> str:
@@ -124,15 +124,15 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     return str(out)
 
 def load_config() -> dict:
-    if "app_config" in st.secrets:           # TOML secrets (recommended)
+    if "app_config" in st.secrets:
         return to_plain(st.secrets["app_config"])
-    if "app_config_yaml" in st.secrets:       # legacy YAML in secrets
+    if "app_config_yaml" in st.secrets:
         try:
             return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
         except Exception as e:
             st.error(f"Invalid YAML in app_config_yaml secret: {e}")
             return {}
-    cfg_file = HERE / "app_config.yaml"       # local file for dev
+    cfg_file = HERE / "app_config.yaml"
     if cfg_file.exists():
         try:
             return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
@@ -149,9 +149,9 @@ def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
 def table_columns_in_order(db_path: str, table: str) -> list[str]:
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-    return [r[1] for r in rows]  # PRAGMA preserves on-disk order
+    return [r[1] for r in rows]
 
-# ---- SAFE Excel export (works even when df is empty) ----
+# ---- Excel/Word export helpers ----
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
     buf = io.BytesIO()
@@ -164,13 +164,13 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
                 width = 12
             else:
                 lens = df[col].astype(str).str.len()
-                q = lens.quantile(0.9) if not lens.empty else 10
-                q = 10 if pd.isna(q) else q
-                width = min(60, max(10, int(q) + 2))
+                q90 = lens.quantile(0.9) if not lens.empty else 10
+                q90 = 10 if pd.isna(q90) else q90
+                width = min(60, max(10, int(q90) + 2))
             ws.set_column(i, i, width)
     return buf.getvalue()
 
-def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
+def to_docx_table_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc = Document()
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(10)
@@ -188,16 +188,55 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.save(out)
     return out.getvalue()
 
-# ---- Date + column helpers ----
+# --- Quote-specific Word builder (Item / Part Number / Description / Qty) ---
+def sanitize_filename(name: str) -> str:
+    name = str(name).strip() or "Unknown"
+    return re.sub(r'[^A-Za-z0-9._ -]+', '_', name)[:80]
+
+def pick_first_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def quote_docx_bytes(lines: pd.DataFrame, *, title: str, vendor: Optional[str]=None) -> bytes:
+    pn_col  = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
+    nm_col  = pick_first_col(lines, ["Name","Line Name","Description","Part Name","Item Name"])
+    qty_col = pick_first_col(lines, [
+        "Qty","Quantity","Qty to Order","Quantity to Order","Order Qty",
+        "Quantity Requested","Qty Requested","Qty Ordered"
+    ])
+
+    # Build a compact quote table
+    table_cols = []
+    if pn_col:  table_cols.append(("Part Number", pn_col))
+    if nm_col:  table_cols.append(("Description", nm_col))
+    if qty_col: table_cols.append(("Qty", qty_col))
+
+    tbl = pd.DataFrame({
+        "Item": range(1, len(lines) + 1)
+    })
+
+    for new_name, src in table_cols:
+        tbl[new_name] = lines[src].astype(str)
+
+    # Fallback: if none matched, just dump all visible columns
+    if tbl.shape[1] == 1:
+        tbl = lines.reset_index(drop=True)
+        tbl.insert(0, "Item", range(1, len(lines)+1))
+
+    # Make the doc
+    heading = f"Quote Request — {vendor}" if vendor else title
+    return to_docx_table_bytes(tbl, heading)
+
+# ---- Date helpers ----
 def strip_time(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """Format any datetime-ish column as YYYY-MM-DD strings (keeps blanks as-is)."""
     for c in cols:
         if c in df.columns:
             s = pd.to_datetime(df[c], errors="coerce")
             df[c] = s.dt.strftime("%Y-%m-%d").where(~s.isna(), df[c])
     return df
 
-# Date columns to format (applied only if they exist)
 DATE_COLS = {
     "restock": [
         "Created On", "Approved On", "Completed On",
@@ -210,16 +249,14 @@ DATE_COLS = {
     ],
 }
 
-# Columns to hide from grid & downloads
 HIDE_COLS = {
     "restock": ["ID", "id", "Purchase Order ID"],
     "po_outstanding": ["ID", "id", "Purchase Order ID", "Column2"],
 }
 
-# ---- "Data last updated" helper (GitHub commit time or local mtime) ----
 def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
     gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh and gh.get('repo') and gh.get('path'):
+    if gh and gh.get('repo') and gh.get('path')):
         try:
             import requests
             url = f"https://api.github.com/repos/{gh['repo']}/commits"
@@ -243,9 +280,8 @@ def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
 
 # ---------- App ----------
 cfg = load_config()
-cfg = to_plain(cfg)  # ensure plain dicts
+cfg = to_plain(cfg)
 
-# Auth (pin streamlit-authenticator==0.2.3)
 cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
@@ -265,8 +301,6 @@ else:
     st.sidebar.success(f"Logged in as {name}")
 
     db_path = resolve_db_path(cfg)
-
-    # Sidebar caption: only the "last updated" info (no DB path, no version)
     updated_label = get_data_last_updated(cfg, db_path)
     if updated_label:
         st.sidebar.caption(updated_label)
@@ -274,24 +308,20 @@ else:
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
 
-    # Dataset -> table name (radio)
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company (case-insensitive username lookup + lenient company matching) ---
+    # --- Authorization by Company ---
     all_companies_df = q(
         f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
         db_path=db_path
     )
     all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
-    # Case-insensitive username handling
     username_ci = str(username).casefold()
-    admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
-    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
+    admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
     is_admin = username_ci in admin_users_ci
 
-    # Case-insensitive lookup of user_companies
     uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
     uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
     allowed_cfg = uc_ci_map.get(username_ci, [])
@@ -300,26 +330,17 @@ else:
     allowed_cfg = [a for a in (allowed_cfg or [])]
 
     def norm(s: str) -> str:
-        # trim, collapse inner spaces, casefold for compare
         return " ".join(str(s).strip().split()).casefold()
 
-    # Build normalization map for DB company strings
-    db_map = {norm(c): c for c in all_companies}         # normalized -> DB original
+    db_map = {norm(c): c for c in all_companies}
     allowed_norm = {norm(a) for a in allowed_cfg}
     star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
 
     if is_admin or star_granted:
-        # Admins (or '*') see everything in the dataset
         allowed_set = set(all_companies)
     else:
-        # Prefer matches that actually exist in the dataset
         matches = {db_map[n] for n in allowed_norm if n in db_map}
-        if matches:
-            allowed_set = matches
-        else:
-            # If none of the configured companies exist in this dataset now,
-            # still show the configured names; selection may yield 0 rows.
-            allowed_set = set(allowed_cfg)
+        allowed_set = matches if matches else set(allowed_cfg)
 
     if not allowed_set:
         st.error("No companies configured for your account. Ask an admin to update your access.")
@@ -330,7 +351,6 @@ else:
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
 
-    # Dropdown: required choice (no default). Admins get an "All" option.
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1:
         select_options += [ADMIN_ALL]
@@ -349,28 +369,31 @@ else:
         chosen_companies = [chosen]
         title_companies = chosen
 
-    # --- Determine available columns now (so we can build a correct search clause)
+    # --- Determine available columns now (for search + vendor detection) ---
     cols_in_db = table_columns_in_order(db_path, src)
     cols_lower = {c.lower(): c for c in cols_in_db}
 
-    # UI: search per dataset (now RE-STOCK supports Vendor/Vendors)
-    if ds == 'RE-STOCK':
-        vendor_col = None
+    # Detect vendor column for search + grouping later
+    vendor_col = None
+    if src == 'restock':
         if 'vendors' in cols_lower:
             vendor_col = cols_lower['vendors']
         elif 'vendor' in cols_lower:
             vendor_col = cols_lower['vendor']
+    else:
+        if 'vendor' in cols_lower:
+            vendor_col = cols_lower['vendor']
 
+    # UI: search
+    if ds == 'RE-STOCK':
         label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
         search = st.sidebar.text_input(label)
-
         if vendor_col:
             search_clause = f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)"
             search_fields = 3
         else:
             search_clause = "([Part Numbers] LIKE ? OR [Name] LIKE ?)"
             search_fields = 2
-
         order_by = "[Company], [Name]"
     else:
         search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
@@ -378,11 +401,10 @@ else:
         search_fields = 4
         order_by = "[Company], date([Created On]) ASC, [Purchase Order #]"
 
-    # Build WHERE (Company required)
+    # Build WHERE
     ph = ','.join(['?'] * len(chosen_companies))
     where = [f"[Company] IN ({ph})"]
     params: list = list(chosen_companies)
-
     if search:
         like = f"%{search}%"
         where.append(search_clause)
@@ -392,42 +414,127 @@ else:
     sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY {order_by}"
     df = q(sql, tuple(params), db_path=db_path)
 
-    # Date-only formatting for known date columns
+    # Date-only formatting
     df = strip_time(df, DATE_COLS.get(src, []))
 
-    # Preserve on-disk order but hide IDs/technical columns
+    # Preserve on-disk order, hide technical cols for *downloads*, not display tweaks
     cols_in_order = table_columns_in_order(db_path, src)
     hide_set = set(HIDE_COLS.get(src, []))
-    cols_in_order = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
-    df = df[cols_in_order]
+    cols_for_download = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
+    df_download = df[cols_for_download]
 
-    # Title & grid
+    # ---------- DISPLAY GRID (with checkboxes; hide Rsvd/Ord/Company only on-screen) ----------
     st.markdown(f"### {ds} — {title_companies}")
-    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Downloads (use the exact same df)
+    display_hide = {"Rsvd","Ord","Company"}
+    display_cols = [c for c in cols_for_download if c not in display_hide]
+    df_display = df[display_cols].copy()
+
+    # Insert Select column at left (default False)
+    if "Select" not in df_display.columns:
+        df_display.insert(0, "Select", False)
+
+    # Build column config: only Select is editable
+    col_cfg = {"Select": st.column_config.CheckboxColumn(
+        "Add to Quote", help="Check to include this line in a quote request", default=False
+    )}
+    for c in df_display.columns:
+        if c != "Select":
+            col_cfg[c] = st.column_config.Column(disabled=True)
+
+    edited = st.data_editor(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config=col_cfg,
+        key=f"grid_{src}"
+    )
+
+    # Recover selected rows using original index alignment
+    try:
+        selected_idx = edited.index[edited["Select"] == True]
+    except Exception:
+        selected_idx = []
+    selected_rows = df.loc[selected_idx] if len(selected_idx) else df.iloc[0:0]
+
+    # ---------- Standard downloads (whole result set) ----------
     c1, c2, _ = st.columns([1, 1, 3])
     with c1:
         st.download_button(
             label='⬇️ Excel (.xlsx)',
-            data=to_xlsx_bytes(df, sheet=ds.replace(' ', '_')),
+            data=to_xlsx_bytes(df_download, sheet=ds.replace(' ', '_')),
             file_name=f"{ds.replace(' ', '_')}.xlsx",
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         )
     with c2:
         st.download_button(
             label='⬇️ Word (.docx)',
-            data=to_docx_bytes(df, title=f"{ds} — {title_companies}"),
+            data=to_docx_table_bytes(df_download, title=f"{ds} — {title_companies}"),
             file_name=f"{ds.replace(' ', '_')}.docx",
             mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
 
-    # Only admins see the config template
+    # ---------- Quote Request generation (selected rows) ----------
+    st.markdown("#### Quote Request (from selected rows)")
+
+    if selected_rows.empty:
+        st.caption("Select rows using the checkboxes to enable quote downloads.")
+    else:
+        # Count vendors on the fly
+        vcol = vendor_col if (vendor_col and vendor_col in selected_rows.columns) else None
+        if vcol:
+            vendor_groups = selected_rows.groupby(selected_rows[vcol].fillna("Unknown"))
+            vendor_list = [(str(v), g.copy()) for v, g in vendor_groups]
+        else:
+            vendor_list = [("Unknown", selected_rows.copy())]
+
+        # Button: one Word per vendor (ZIP)
+        def build_zip_per_vendor() -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for vname, gdf in vendor_list:
+                    title = f"{ds} — {title_companies}"
+                    doc_bytes = quote_docx_bytes(gdf, title=title, vendor=vname)
+                    # File name includes company and vendor
+                    fname = f"Quote_{sanitize_filename(title_companies)}_{sanitize_filename(vname)}.docx"
+                    zf.writestr(fname, doc_bytes)
+            return buf.getvalue()
+
+        # Button: single combined Word
+        def build_single_doc() -> bytes:
+            title = f"{ds} — {title_companies}"
+            return quote_docx_bytes(selected_rows, title=title, vendor=None)
+
+        c3, c4, _ = st.columns([1.6, 1.6, 2.8])
+        with c3:
+            st.download_button(
+                "🧾 Generate Quote per Vendor (ZIP)",
+                data=build_zip_per_vendor(),
+                file_name=f"Quotes_{ds.replace(' ','_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+            )
+        with c4:
+            # If exactly one vendor, also offer a single direct .docx w/ vendor in name; else a combined doc
+            if len(vendor_list) == 1:
+                vname, gdf = vendor_list[0]
+                st.download_button(
+                    f"🧾 Single Word — {vname}",
+                    data=quote_docx_bytes(gdf, title=f"{ds} — {title_companies}", vendor=vname),
+                    file_name=f"Quote_{sanitize_filename(title_companies)}_{sanitize_filename(vname)}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            else:
+                st.download_button(
+                    "🧾 Single Word — All Selected",
+                    data=build_single_doc(),
+                    file_name=f"Quote_All_Selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+
+    # ---------- Config template (admins only) ----------
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
-
-
 
 
 
