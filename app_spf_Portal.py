@@ -8,9 +8,10 @@
 # - Dates shown as YYYY-MM-DD (no time)
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
-# - Grid hides Rsvd/Ord/Company on-screen, has Select checkboxes
-# - Shopping-cart flow: Add to Cart, edit Qty, Remove, Clear cart
-# - Quote from CART (single Word; no ZIP)
+# - Shopping cart flow with forms (no auto-reruns while editing):
+#     • Results grid: Select checkboxes → 🛒 Add selected to cart
+#     • Cart: edit Qty freely → 💾 Save Qty, 🗑️ Remove, 🧼 Clear cart
+# - Quote from CART (single Word)
 # - Quote table: Part Number | Part Name | Qty + 10 blank rows
 #
 # requirements.txt (minimum):
@@ -28,7 +29,7 @@ import os, io, sqlite3, textwrap, re, hashlib
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Optional, Iterable, List
+from typing import Optional, Iterable, List, Tuple
 import pandas as pd
 import streamlit as st
 import yaml
@@ -141,39 +142,30 @@ def load_config() -> dict:
             return {}
     return yaml.safe_load(CONFIG_TEMPLATE_YAML)
 
-def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
-    path = db_path or DEFAULT_DB
-    with sqlite3.connect(path) as conn:
+# ---- caching helpers for speed ----
+def _db_sig(db_path: str) -> int:
+    try:
+        return Path(db_path).stat().st_mtime_ns
+    except Exception:
+        return 0
+
+@st.cache_data(show_spinner=False)
+def q_cached(sql: str, params: Tuple, db_path: str, db_sig: int) -> pd.DataFrame:
+    with sqlite3.connect(db_path) as conn:
         return pd.read_sql_query(sql, conn, params=params)
 
-def table_columns_in_order(db_path: str, table: str) -> list[str]:
+@st.cache_data(show_spinner=False)
+def table_columns_in_order_cached(db_path: str, table: str, db_sig: int) -> list[str]:
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
     return [r[1] for r in rows]
 
-# ---- Row key helpers (for persistent cart) ----
-KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
+def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
+    path = db_path or DEFAULT_DB
+    return q_cached(sql, tuple(params), path, _db_sig(path))
 
-def attach_row_key(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach a stable __KEY__ column used to persist items in cart across filters."""
-    df = df.copy()
-    key_col = next((c for c in KEY_COL_CANDIDATES if c in df.columns), None)
-    if key_col:
-        df["__KEY__"] = df[key_col].astype(str)
-        return df
-    # fallback: hash important columns if present; else hash all columns as string
-    columns_priority = [
-        "Part Number","Part Numbers","Part #","Part No","PN",
-        "Name","Line Name","Description",
-        "Vendor","Vendors","Company",
-        "Created On"
-    ]
-    cols = [c for c in columns_priority if c in df.columns]
-    if not cols:
-        cols = list(df.columns)
-    s = df[cols].astype(str).agg("|".join, axis=1)
-    df["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
-    return df
+def table_columns_in_order(db_path: str, table: str) -> list[str]:
+    return table_columns_in_order_cached(db_path, table, _db_sig(db_path))
 
 # ---- Excel/Word export helpers ----
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
@@ -245,26 +237,14 @@ def compute_qty_min_minus_stock(df: pd.DataFrame) -> pd.Series:
 def qty_series_for_lines(lines: pd.DataFrame) -> pd.Series:
     """Prefer user-edited __QTY__; fallback to computed Min-InStk."""
     if "__QTY__" in lines.columns:
-        q = lines["__QTY__"]
-        # normalize to stringy display (integers no .0)
-        def fmt(x):
-            if x is None or (isinstance(x, float) and pd.isna(x)) or (isinstance(x, str) and x.strip() == ""):
-                return None
-            try:
-                xf = float(x)
-                return str(int(xf)) if xf.is_integer() else str(xf)
-            except Exception:
-                return str(x)
-        q = q.apply(fmt)
+        q = lines["__QTY__"].copy()
     else:
         q = pd.Series([None] * len(lines), index=lines.index, dtype="object")
 
-    # Where missing, compute default
-    need = q.isna()
+    need = q.isna() | (q.astype(str).str.strip() == "")
     if need.any():
         q_def = compute_qty_min_minus_stock(lines)
         q = q.where(~need, q_def)
-    # Final: replace NaN/None with ""
     q = q.apply(lambda x: "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
     return q
 
@@ -287,7 +267,6 @@ def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_compan
     blanks = pd.DataFrame([{"Part Number":"", "Part Name":"", "Qty":""} for _ in range(10)])
     out_final = pd.concat([out.reset_index(drop=True), blanks], ignore_index=True)
 
-    # ---- build the docx
     doc = Document()
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(10)
@@ -432,14 +411,13 @@ else:
 
     if not allowed_set:
         st.error("No companies configured for your account. Ask an admin to update your access.")
-    with st.expander("Company values present in DB"):
-        st.write(sorted(all_companies))
-        # If none configured, stop here
-        if not allowed_set:
-            st.stop()
+        with st.expander("Company values present in DB"):
+            st.write(sorted(all_companies))
+        st.stop()
 
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
+
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1:
         select_options += [ADMIN_ALL]
@@ -507,30 +485,41 @@ else:
     df = strip_time(df, DATE_COLS.get(src, []))
 
     # Attach keys for cart
+    KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
+    def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_in = df_in.copy()
+        key_col = next((c for c in KEY_COL_CANDIDATES if c in df_in.columns), None)
+        if key_col:
+            df_in["__KEY__"] = df_in[key_col].astype(str)
+            return df_in
+        cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN","Name","Line Name","Description","Vendor","Vendors","Company","Created On"] if c in df_in.columns]
+        if not cols: cols = list(df_in.columns)
+        s = df_in[cols].astype(str).agg("|".join, axis=1)
+        df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+        return df_in
+
     df = attach_row_key(df)
 
     # Downloads frame (hide IDs + internals)
-    cols_in_order = table_columns_in_order(db_path, src)
     hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__", "__QTY__"}
-    cols_for_download = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
+    cols_for_download = [c for c in cols_in_db if (c in df.columns) and (c not in hide_set)]
     df_download = df[cols_for_download]
 
-    # ---------- GRID (checkboxes; hide Rsvd/Ord/Company; Add to Cart) ----------
+    # ---------- RESULTS GRID (FORM) ----------
     st.markdown(f"### {ds} — {title_companies}")
 
     display_hide = {"Rsvd","Ord","Company","__KEY__","__QTY__"}
     display_cols = [c for c in cols_for_download if c not in display_hide]
     df_display = df[display_cols].copy()
-
     if "Select" not in df_display.columns:
         df_display.insert(0, "Select", False)
 
-    col_cfg = {"Select": st.column_config.CheckboxColumn(
+    grid_col_cfg = {"Select": st.column_config.CheckboxColumn(
         "Add to Cart", help="Check to include this line in the cart", default=False
     )}
     for c in df_display.columns:
         if c != "Select":
-            col_cfg[c] = st.column_config.Column(disabled=True)
+            grid_col_cfg[c] = st.column_config.Column(disabled=True)
 
     base_key = f"grid_{src}"
     ver_key = f"{base_key}_ver"
@@ -538,15 +527,18 @@ else:
         st.session_state[ver_key] = 0
     grid_key = f"{base_key}_{st.session_state[ver_key]}"
 
-    edited = st.data_editor(
-        df_display,
-        use_container_width=True,
-        hide_index=True,
-        column_config=col_cfg,
-        key=grid_key,
-    )
+    with st.form(f"{grid_key}_form", clear_on_submit=False):
+        edited = st.data_editor(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config=grid_col_cfg,
+            key=grid_key,
+        )
+        c_add, c_clear_sel = st.columns([1.6, 1.3])
+        add_clicked = c_add.form_submit_button("🛒 Add selected to cart", use_container_width=True)
+        clear_sel_clicked = c_clear_sel.form_submit_button("🧹 Clear selections", use_container_width=True)
 
-    # Selected rows in current grid view
     try:
         selected_idx = edited.index[edited["Select"] == True]
     except Exception:
@@ -558,29 +550,21 @@ else:
     if cart_key not in st.session_state:
         st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
 
-    # Controls: add to cart / clear selections
-    c_add, c_clear_sel, _ = st.columns([1.6, 1.3, 6])
-    with c_add:
-        if st.button("🛒 Add selected to cart", disabled=selected_rows.empty):
-            if not selected_rows.empty:
-                # ensure __QTY__ defaults for new additions
-                add_df = selected_rows.copy()
-                if "__QTY__" not in add_df.columns:
-                    add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
-                else:
-                    # fill blanks with default
-                    mask_blank = add_df["__QTY__"].isna() | (add_df["__QTY__"].astype(str).str.strip() == "")
-                    add_df.loc[mask_blank, "__QTY__"] = compute_qty_min_minus_stock(add_df[mask_blank])
-                merged = pd.concat([st.session_state[cart_key], add_df], ignore_index=True)
-                st.session_state[cart_key] = merged.drop_duplicates(subset="__KEY__", keep="first").reset_index(drop=True)
-                st.session_state[ver_key] += 1
-                st.rerun()
-    with c_clear_sel:
-        if st.button("🧹 Clear selections"):
-            st.session_state[ver_key] += 1
-            st.rerun()
+    if add_clicked and not selected_rows.empty:
+        add_df = selected_rows.copy()
+        if "__QTY__" not in add_df.columns:
+            add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
+        else:
+            mask_blank = add_df["__QTY__"].isna() | (add_df["__QTY__"].astype(str).str.strip() == "")
+            add_df.loc[mask_blank, "__QTY__"] = compute_qty_min_minus_stock(add_df[mask_blank])
+        merged = pd.concat([st.session_state[cart_key], add_df], ignore_index=True)
+        st.session_state[cart_key] = merged.drop_duplicates(subset="__KEY__", keep="first").reset_index(drop=True)
 
-    # ---------- Standard downloads (whole result set) ----------
+    if clear_sel_clicked:
+        # bump version so next render shows clean checkboxes
+        st.session_state[ver_key] += 1
+
+    # ---------- Standard downloads ----------
     c1, c2, _ = st.columns([1, 1, 6])
     with c1:
         st.download_button(
@@ -597,49 +581,45 @@ else:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
-    # ---------- Cart ----------
+    # ---------- CART (FORM) ----------
     cart_df: pd.DataFrame = st.session_state[cart_key]
     st.markdown(f"#### Cart ({len(cart_df)} item{'s' if len(cart_df)!=1 else ''})")
 
-    # Add keys if missing (safety) and ensure __QTY__ exists
+    # ensure internals
     if cart_df.empty:
         cart_df = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
         st.session_state[cart_key] = cart_df
     else:
         if "__KEY__" not in cart_df.columns:
+            # safety
+            KEY_COLS_SAFE = ["__KEY__"]
+            cart_df = cart_df.copy()
             cart_df = attach_row_key(cart_df)
         if "__QTY__" not in cart_df.columns:
             cart_df["__QTY__"] = compute_qty_min_minus_stock(cart_df)
         st.session_state[cart_key] = cart_df
 
-    # Build a clean cart display: Remove | Part Number | Part Name | Vendor | Qty (editable)
     pn = pick_first_col(cart_df, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
     nm = pick_first_col(cart_df, ["Name","Line Name","Description","Part Name","Item Name"])
     vd = pick_first_col(cart_df, ["Vendor","Vendors"])
 
     cart_display = pd.DataFrame(index=cart_df.index)
-    if "Remove" not in cart_display.columns:
-        cart_display["Remove"] = False
+    cart_display["Remove"] = False
     if pn: cart_display["Part Number"] = cart_df[pn]
-    if nm: cart_display["Part Name"] = cart_df[nm]
-    if vd: cart_display["Vendor"] = cart_df[vd]
-
-    # Qty column shown to user; pull from __QTY__ if present, else compute
-    if "__QTY__" in cart_df.columns:
-        show_qty = cart_df["__QTY__"]
-    else:
-        show_qty = compute_qty_min_minus_stock(cart_df)
-    # Try to present as numeric where possible
-    def to_float_or_str(x):
+    if nm: cart_display["Part Name"]   = cart_df[nm]
+    if vd: cart_display["Vendor"]      = cart_df[vd]
+    # Show Qty as numeric when possible; keep original strings otherwise
+    def to_num(x):
         try:
-            return float(x)
+            xf = float(x)
+            return int(xf) if xf.is_integer() else xf
         except Exception:
             return None if (x is None or (isinstance(x, str) and x.strip()=="")) else x
-    cart_display["Qty"] = show_qty.apply(to_float_or_str)
+    cart_display["Qty"] = cart_df["__QTY__"].apply(to_num)
 
     cart_col_cfg = {
         "Remove": st.column_config.CheckboxColumn("Remove", help="Check to remove from cart", default=False),
-        "Qty": st.column_config.NumberColumn("Qty", help="Edit requested quantity", step=1)
+        "Qty": st.column_config.NumberColumn("Qty", help="Edit requested quantity", step=1, min_value=0),
     }
 
     cart_base = f"cart_{src}_editor"
@@ -648,45 +628,42 @@ else:
         st.session_state[cart_ver_key] = 0
     cart_editor_key = f"{cart_base}_{st.session_state[cart_ver_key]}"
 
-    edited_cart = st.data_editor(
-        cart_display,
-        use_container_width=True,
-        hide_index=True,
-        column_config=cart_col_cfg,
-        key=cart_editor_key,
-    )
+    with st.form(f"{cart_editor_key}_form", clear_on_submit=False):
+        edited_cart = st.data_editor(
+            cart_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config=cart_col_cfg,
+            key=cart_editor_key,
+        )
+        c_save, c_rm, c_clear = st.columns([1.2, 1.2, 1.1])
+        save_qty = c_save.form_submit_button("💾 Save Qty", use_container_width=True)
+        remove_btn = c_rm.form_submit_button("🗑️ Remove selected", use_container_width=True)
+        clear_cart_btn = c_clear.form_submit_button("🧼 Clear cart", use_container_width=True, disabled=cart_df.empty)
 
-    # Persist Qty edits back to __QTY__ immediately
-    if "Qty" in edited_cart.columns:
-        new_qty = edited_cart["Qty"]
-        # convert floats like 3.0 -> "3", leave strings as-is
+    if save_qty and "Qty" in edited_cart.columns:
         def norm_q(v):
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                return ""
+            if v is None: return ""
             if isinstance(v, (int, float)):
                 return str(int(v)) if float(v).is_integer() else str(v)
             return str(v)
-        st.session_state[cart_key].loc[new_qty.index, "__QTY__"] = new_qty.apply(norm_q).values
+        st.session_state[cart_key].loc[edited_cart.index, "__QTY__"] = edited_cart["Qty"].apply(norm_q).values
 
-    c_rm, c_clear_cart, _ = st.columns([1.2, 1.1, 6])
-    with c_rm:
-        if st.button("🗑️ Remove selected"):
-            try:
-                to_remove_idx = edited_cart.index[edited_cart["Remove"] == True]
-            except Exception:
-                to_remove_idx = []
-            if len(to_remove_idx):
-                keys_to_remove = st.session_state[cart_key].loc[to_remove_idx, "__KEY__"].tolist()
-                st.session_state[cart_key] = st.session_state[cart_key].loc[
-                    ~st.session_state[cart_key]["__KEY__"].isin(keys_to_remove)
-                ].reset_index(drop=True)
-                st.session_state[cart_ver_key] += 1
-                st.rerun()
-    with c_clear_cart:
-        if st.button("🧼 Clear cart", disabled=st.session_state[cart_key].empty):
-            st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
+    if remove_btn:
+        try:
+            to_remove_idx = edited_cart.index[edited_cart["Remove"] == True]
+        except Exception:
+            to_remove_idx = []
+        if len(to_remove_idx):
+            keys_to_remove = st.session_state[cart_key].loc[to_remove_idx, "__KEY__"].tolist()
+            st.session_state[cart_key] = st.session_state[cart_key].loc[
+                ~st.session_state[cart_key]["__KEY__"].isin(keys_to_remove)
+            ].reset_index(drop=True)
             st.session_state[cart_ver_key] += 1
-            st.rerun()
+
+    if clear_cart_btn:
+        st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
+        st.session_state[cart_ver_key] += 1
 
     # ---------- Quote Request (from CART) ----------
     st.markdown("#### Quote Request (from cart)")
@@ -718,8 +695,6 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
-
-
 
 
 
