@@ -8,10 +8,10 @@
 # - Dates shown as YYYY-MM-DD (no time)
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
-# - Shopping cart flow with forms (no auto-reruns while editing):
-#     • Results grid: Select checkboxes → 🛒 Add selected to cart
-#     • Cart: edit Qty freely → 💾 Save Qty, 🗑️ Remove, 🧼 Clear cart
-# - Quote from CART (single Word)
+# - Shopping cart flow using forms (edit without refresh):
+#     • Results grid: Select → 🛒 Add selected to cart  |  🧹 Clear selections
+#     • Cart: edit Qty → 💾 Save Qty  |  🗑️ Remove  |  🧼 Clear cart
+# - Cart enforces a single Vendor; quote header always uses that Vendor.
 # - Quote table: Part Number | Part Name | Qty + 10 blank rows
 #
 # requirements.txt (minimum):
@@ -253,7 +253,6 @@ def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_compan
     Build the requested Quote doc:
       Header: Vendor + "Quote Request — YYYY-MM-DD"
       Table: Part Number | Part Name | Qty + 10 blank rows
-      Qty prefers user-edited values (__QTY__), fallback to Min-InStk
     """
     pn_col   = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
     name_col = pick_first_col(lines, ["Name","Line Name","Description","Part Name","Item Name"])
@@ -451,7 +450,7 @@ else:
         if 'vendor' in cols_lower:
             vendor_col = cols_lower['vendor']
 
-    # Search
+    # Search (kept simple; form not needed here)
     if ds == 'RE-STOCK':
         label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
         search = st.sidebar.text_input(label)
@@ -550,19 +549,44 @@ else:
     if cart_key not in st.session_state:
         st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
 
+    # --- Add to cart (enforce single vendor) ---
     if add_clicked and not selected_rows.empty:
         add_df = selected_rows.copy()
-        if "__QTY__" not in add_df.columns:
-            add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
-        else:
-            mask_blank = add_df["__QTY__"].isna() | (add_df["__QTY__"].astype(str).str.strip() == "")
-            add_df.loc[mask_blank, "__QTY__"] = compute_qty_min_minus_stock(add_df[mask_blank])
+        # Initialize qty defaults
+        add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
+
+        if vendor_col:
+            # Normalize vendor strings for compare
+            sel_vendors = sorted(set(add_df[vendor_col].dropna().astype(str).str.strip()))
+            cart_df = st.session_state[cart_key]
+            cart_vendors = sorted(set(cart_df[vendor_col].dropna().astype(str).str.strip())) if (not cart_df.empty and vendor_col in cart_df.columns) else []
+
+            if not cart_vendors:
+                # Cart empty (or without vendor); if multiple vendors in selection, pick first and filter
+                if len(sel_vendors) > 1:
+                    chosen_vendor = sel_vendors[0]
+                    add_df = add_df[add_df[vendor_col].astype(str).str.strip() == chosen_vendor]
+                    st.info(f"Cart is per-vendor. Added only Vendor '{chosen_vendor}' from selection.")
+                else:
+                    chosen_vendor = sel_vendors[0] if sel_vendors else "Unknown"
+                # proceed to add
+            else:
+                # Cart already has a vendor; accept only that vendor
+                chosen_vendor = cart_vendors[0]
+                before = len(add_df)
+                add_df = add_df[add_df[vendor_col].astype(str).str.strip() == chosen_vendor]
+                skipped = before - len(add_df)
+                if skipped > 0:
+                    st.warning(f"Cart locked to Vendor '{chosen_vendor}'. Skipped {skipped} item(s) from other vendor(s).")
+        # Merge + dedupe by __KEY__
         merged = pd.concat([st.session_state[cart_key], add_df], ignore_index=True)
         st.session_state[cart_key] = merged.drop_duplicates(subset="__KEY__", keep="first").reset_index(drop=True)
+        st.success(f"Added {len(add_df)} item(s) to cart.")
+        st.rerun()  # immediate reflect
 
     if clear_sel_clicked:
-        # bump version so next render shows clean checkboxes
         st.session_state[ver_key] += 1
+        st.rerun()  # clear now (no second click)
 
     # ---------- Standard downloads ----------
     c1, c2, _ = st.columns([1, 1, 6])
@@ -591,8 +615,6 @@ else:
         st.session_state[cart_key] = cart_df
     else:
         if "__KEY__" not in cart_df.columns:
-            # safety
-            KEY_COLS_SAFE = ["__KEY__"]
             cart_df = cart_df.copy()
             cart_df = attach_row_key(cart_df)
         if "__QTY__" not in cart_df.columns:
@@ -601,14 +623,14 @@ else:
 
     pn = pick_first_col(cart_df, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
     nm = pick_first_col(cart_df, ["Name","Line Name","Description","Part Name","Item Name"])
-    vd = pick_first_col(cart_df, ["Vendor","Vendors"])
+    vd = vendor_col
 
     cart_display = pd.DataFrame(index=cart_df.index)
     cart_display["Remove"] = False
     if pn: cart_display["Part Number"] = cart_df[pn]
     if nm: cart_display["Part Name"]   = cart_df[nm]
     if vd: cart_display["Vendor"]      = cart_df[vd]
-    # Show Qty as numeric when possible; keep original strings otherwise
+
     def to_num(x):
         try:
             xf = float(x)
@@ -648,6 +670,7 @@ else:
                 return str(int(v)) if float(v).is_integer() else str(v)
             return str(v)
         st.session_state[cart_key].loc[edited_cart.index, "__QTY__"] = edited_cart["Qty"].apply(norm_q).values
+        st.success("Saved quantities.")
 
     if remove_btn:
         try:
@@ -660,20 +683,30 @@ else:
                 ~st.session_state[cart_key]["__KEY__"].isin(keys_to_remove)
             ].reset_index(drop=True)
             st.session_state[cart_ver_key] += 1
+            st.rerun()  # reflect immediately
 
     if clear_cart_btn:
         st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
         st.session_state[cart_ver_key] += 1
+        st.rerun()  # reflect immediately
 
     # ---------- Quote Request (from CART) ----------
     st.markdown("#### Quote Request (from cart)")
     if st.session_state[cart_key].empty:
         st.caption("Add items to the cart above to enable the quote download.")
     else:
+        # Enforce single vendor at quote time, too (safety)
         if vendor_col and vendor_col in st.session_state[cart_key].columns:
-            vendors = sorted(set(st.session_state[cart_key][vendor_col].dropna().astype(str)))
-            v_header = vendors[0] if len(vendors) == 1 else "Multiple"
+            vendors = sorted(set(st.session_state[cart_key][vendor_col].dropna().astype(str).str.strip()))
+            if len(vendors) != 1:
+                st.error("Cart has multiple vendors. Please remove items so only one vendor remains before generating the quote.")
+                can_download = False
+                v_header = "Multiple"
+            else:
+                can_download = True
+                v_header = vendors[0]
         else:
+            can_download = True
             v_header = "Unknown"
 
         def build_single_doc() -> bytes:
@@ -684,20 +717,19 @@ else:
                 dataset_label=ds
             )
 
-        st.download_button(
-            "🧾 Generate Quote (Word)",
-            data=build_single_doc(),
-            file_name=f"Quote_{sanitize_filename(title_companies)}_{datetime.now().strftime('%Y%m%d')}.docx",
-            mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        )
-
+        if can_download:
+            st.download_button(
+                "🧾 Generate Quote (Word)",
+                data=build_single_doc(),
+                file_name=f"Quote_{sanitize_filename(title_companies)}_{datetime.now().strftime('%Y%m%d')}.docx",
+                mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            )
+        else:
+            st.caption("Tip: Use the Cart’s 🗑️ Remove or 🧼 Clear cart to fix the vendor mix.")
     # ---------- Config template (admins only) ----------
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
-
-
-
 
 
 
