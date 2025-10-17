@@ -9,8 +9,9 @@
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
 # - Grid hides Rsvd/Ord/Company on-screen, has Select checkboxes
-# - Quote from selected rows: single Word doc (no ZIP)
-# - Quote table: Part Number | Part Name | Qty (Min-InStk) + 10 blank rows
+# - Shopping-cart flow: Add to Cart, Remove, Clear cart
+# - Quote from CART (single Word; no ZIP)
+# - Quote table: Part Number | Part Name | Qty (Min-InStk) as "Qty" + 10 blank rows
 #
 # requirements.txt (minimum):
 #   streamlit>=1.37
@@ -23,7 +24,7 @@
 #   requests>=2.31
 
 from __future__ import annotations
-import os, io, sqlite3, textwrap, re
+import os, io, sqlite3, textwrap, re, hashlib
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -150,6 +151,31 @@ def table_columns_in_order(db_path: str, table: str) -> list[str]:
         rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
     return [r[1] for r in rows]
 
+# ---- Row key helpers (for persistent cart) ----
+KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
+
+def attach_row_key(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach a stable __KEY__ column used to persist items in cart across filters."""
+    df = df.copy()
+    key_col = next((c for c in KEY_COL_CANDIDATES if c in df.columns), None)
+    if key_col:
+        df["__KEY__"] = df[key_col].astype(str)
+        return df
+    # fallback: hash important columns if present; else hash all columns as string
+    columns_priority = [
+        "Part Number","Part Numbers","Part #","Part No","PN",
+        "Name","Line Name","Description",
+        "Vendor","Vendors","Company",
+        "Created On"
+    ]
+    cols = [c for c in columns_priority if c in df.columns]
+    if not cols:
+        cols = list(df.columns)
+    # Build a deterministic string per row and hash it
+    s = df[cols].astype(str).agg("|".join, axis=1)
+    df["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+    return df
+
 # ---- Excel/Word export helpers ----
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
@@ -214,16 +240,16 @@ def compute_qty_min_minus_stock(df: pd.DataFrame) -> pd.Series:
     m = pd.to_numeric(df[min_col], errors="coerce")
     s = pd.to_numeric(df[stk_col], errors="coerce")
     diff = m - s
-    # Nice display: integers without .0, else as-is
+    # integers without .0; blanks for NaN
     out = diff.apply(lambda x: ("" if pd.isna(x) else (str(int(x)) if float(x).is_integer() else str(x))))
-    out = out.astype("object")
-    return out
+    return out.astype("object")
 
 def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_companies: str, dataset_label: str) -> bytes:
     """
     Build the requested Quote doc:
       Header: Vendor + "Quote Request — YYYY-MM-DD"
-      Table: Part Number | Part Name | Qty (Min-InStk) + 10 blank rows
+      Table: Part Number | Part Name | Qty + 10 blank rows
+      Qty is Min - InStk (exact)
     """
     pn_col   = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
     name_col = pick_first_col(lines, ["Name","Line Name","Description","Part Name","Item Name"])
@@ -232,10 +258,10 @@ def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_compan
     out = pd.DataFrame(index=lines.index)
     out["Part Number"] = lines[pn_col].astype(str) if pn_col else ""
     out["Part Name"]   = lines[name_col].astype(str) if name_col else ""
-    out["Qty (Min-InStk)"] = compute_qty_min_minus_stock(lines)
+    out["Qty"]         = compute_qty_min_minus_stock(lines)
 
     # Append 10 blank rows
-    blanks = pd.DataFrame([{"Part Number":"", "Part Name":"", "Qty (Min-InStk)":""} for _ in range(10)])
+    blanks = pd.DataFrame([{"Part Number":"", "Part Name":"", "Qty":""} for _ in range(10)])
     out_final = pd.concat([out.reset_index(drop=True), blanks], ignore_index=True)
 
     # ---- build the docx
@@ -350,20 +376,17 @@ else:
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company (case-insensitive username lookup + lenient company matching) ---
+    # --- Authorization by Company ---
     all_companies_df = q(
         f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
         db_path=db_path
     )
     all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
-    # Case-insensitive username handling
     username_ci = str(username).casefold()
-    admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
-    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
+    admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
     is_admin = username_ci in admin_users_ci
 
-    # Case-insensitive lookup of user_companies
     uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
     uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
     allowed_cfg = uc_ci_map.get(username_ci, [])
@@ -372,26 +395,17 @@ else:
     allowed_cfg = [a for a in (allowed_cfg or [])]
 
     def norm(s: str) -> str:
-        # trim, collapse inner spaces, casefold for compare
         return " ".join(str(s).strip().split()).casefold()
 
-    # Build normalization map for DB company strings
-    db_map = {norm(c): c for c in all_companies}         # normalized -> DB original
+    db_map = {norm(c): c for c in all_companies}
     allowed_norm = {norm(a) for a in allowed_cfg}
     star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
 
     if is_admin or star_granted:
-        # Admins (or '*') see everything in the dataset
         allowed_set = set(all_companies)
     else:
-        # Prefer matches that actually exist in the dataset
         matches = {db_map[n] for n in allowed_norm if n in db_map}
-        if matches:
-            allowed_set = matches
-        else:
-            # If none of the configured companies exist in this dataset now,
-            # still show the configured names; selection may yield 0 rows.
-            allowed_set = set(allowed_cfg)
+        allowed_set = matches if matches else set(allowed_cfg)
 
     if not allowed_set:
         st.error("No companies configured for your account. Ask an admin to update your access.")
@@ -402,7 +416,6 @@ else:
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
 
-    # Dropdown: required choice (no default). Admins get an "All" option.
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1:
         select_options += [ADMIN_ALL]
@@ -421,11 +434,11 @@ else:
         chosen_companies = [chosen]
         title_companies = chosen
 
-    # --- Determine available columns now (for search + vendor detection) ---
+    # --- Query data ---
     cols_in_db = table_columns_in_order(db_path, src)
     cols_lower = {c.lower(): c for c in cols_in_db}
 
-    # Detect vendor column for search + grouping later
+    # Detect vendor column
     vendor_col = None
     if src == 'restock':
         if 'vendors' in cols_lower:
@@ -436,7 +449,7 @@ else:
         if 'vendor' in cols_lower:
             vendor_col = cols_lower['vendor']
 
-    # UI: search
+    # Search
     if ds == 'RE-STOCK':
         label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
         search = st.sidebar.text_input(label)
@@ -453,7 +466,7 @@ else:
         search_fields = 4
         order_by = "[Company], date([Created On]) ASC, [Purchase Order #]"
 
-    # Build WHERE
+    # WHERE
     ph = ','.join(['?'] * len(chosen_companies))
     where = [f"[Company] IN ({ph})"]
     params: list = list(chosen_companies)
@@ -469,46 +482,38 @@ else:
     # Date-only formatting
     df = strip_time(df, DATE_COLS.get(src, []))
 
-    # Preserve on-disk order but hide IDs/technical columns for downloads
+    # Attach stable row keys for cart
+    df = attach_row_key(df)
+
+    # Downloads frame: preserve on-disk order, hide IDs
     cols_in_order = table_columns_in_order(db_path, src)
-    hide_set = set(HIDE_COLS.get(src, []))
+    hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__"}
     cols_for_download = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
     df_download = df[cols_for_download]
 
-    # ---------- DISPLAY GRID (with checkboxes; hide Rsvd/Ord/Company only on-screen) ----------
+    # ---------- GRID (checkboxes; hide Rsvd/Ord/Company; Add to Cart) ----------
     st.markdown(f"### {ds} — {title_companies}")
 
-    # Hide only on-screen
-    display_hide = {"Rsvd", "Ord", "Company"}
+    display_hide = {"Rsvd","Ord","Company","__KEY__"}
     display_cols = [c for c in cols_for_download if c not in display_hide]
-
-    # Base display DF for the grid (fresh each run)
     df_display = df[display_cols].copy()
 
-    # Insert Select column at the left (default False each render)
     if "Select" not in df_display.columns:
         df_display.insert(0, "Select", False)
 
-    # Column config: only Select is editable
-    col_cfg = {
-        "Select": st.column_config.CheckboxColumn(
-            "Add to Quote",
-            help="Check to include this line in a quote request",
-            default=False,
-        )
-    }
+    col_cfg = {"Select": st.column_config.CheckboxColumn(
+        "Add to Quote", help="Check to include this line in the cart", default=False
+    )}
     for c in df_display.columns:
         if c != "Select":
             col_cfg[c] = st.column_config.Column(disabled=True)
 
-    # Versioned widget key so clear selections can reset the checkboxes
     base_key = f"grid_{src}"
     ver_key = f"{base_key}_ver"
     if ver_key not in st.session_state:
         st.session_state[ver_key] = 0
     grid_key = f"{base_key}_{st.session_state[ver_key]}"
 
-    # Render the editor with the DataFrame itself
     edited = st.data_editor(
         df_display,
         use_container_width=True,
@@ -517,15 +522,36 @@ else:
         key=grid_key,
     )
 
-    # Figure out which rows were selected (keeps original index)
+    # Selected rows in current grid view
     try:
         selected_idx = edited.index[edited["Select"] == True]
     except Exception:
         selected_idx = []
     selected_rows = df.loc[selected_idx] if len(selected_idx) else df.iloc[0:0]
 
-    # ---------- Standard downloads (whole result set) + Clear selections ----------
-    c1, c2, c3, _ = st.columns([1, 1, 1, 3])
+    # ---- Cart state (per dataset+company) ----
+    cart_key = f"cart_{src}_{hashlib.md5(('|'.join(chosen_companies)).encode()).hexdigest()}"
+    if cart_key not in st.session_state:
+        st.session_state[cart_key] = pd.DataFrame(columns=df.columns)
+
+    # Controls: add to cart / clear selections
+    c_add, c_clear_sel, _ = st.columns([1.3, 1.2, 6])
+    with c_add:
+        if st.button("🛒 Add selected to cart", disabled=selected_rows.empty):
+            if not selected_rows.empty:
+                # merge + dedupe by __KEY__
+                merged = pd.concat([st.session_state[cart_key], selected_rows], ignore_index=True)
+                st.session_state[cart_key] = merged.drop_duplicates(subset="__KEY__", keep="first").reset_index(drop=True)
+                # reset checkboxes
+                st.session_state[ver_key] += 1
+                st.rerun()
+    with c_clear_sel:
+        if st.button("🧹 Clear selections"):
+            st.session_state[ver_key] += 1
+            st.rerun()
+
+    # ---------- Standard downloads (whole result set) ----------
+    c1, c2, _ = st.columns([1, 1, 6])
     with c1:
         st.download_button(
             label="⬇️ Excel (.xlsx)",
@@ -540,27 +566,92 @@ else:
             file_name=f"{ds.replace(' ', '_')}.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
-    with c3:
-        # Clear selections: bump version so the widget key changes, wiping prior checkbox state
-        if st.button("🧹 Clear selections"):
-            st.session_state[ver_key] += 1
+
+    # ---------- Cart ----------
+    cart_df: pd.DataFrame = st.session_state[cart_key]
+    st.markdown(f"#### Cart ({len(cart_df)} item{'s' if len(cart_df)!=1 else ''})")
+
+    # Show a lightweight cart view
+    cart_view_cols = []
+    for cands in (["Part Number","Part Numbers","Part #","Part","Part No","PN"],
+                  ["Name","Line Name","Description","Part Name","Item Name"],
+                  ["Vendor","Vendors"]):
+        pick = pick_first_col(cart_df, cands)
+        if pick:
+            cart_view_cols.append(pick)
+    if "__KEY__" not in cart_df.columns:
+        cart_df = attach_row_key(cart_df)
+        st.session_state[cart_key] = cart_df
+
+    cart_display = pd.DataFrame(index=cart_df.index)
+    # Keep original index so we can map back
+    if cart_view_cols:
+        for c in cart_view_cols:
+            cart_display[c] = cart_df[c]
+    else:
+        cart_display = cart_df.copy()
+    # Remove noisy columns if present
+    for c in ["Company", "Rsvd", "Ord"]:
+        if c in cart_display.columns:
+            cart_display = cart_display.drop(columns=[c])
+    # Insert Remove checkbox
+    if "Remove" not in cart_display.columns:
+        cart_display.insert(0, "Remove", False)
+
+    # Versioned key for cart editor too
+    cart_base = f"cart_{src}_editor"
+    cart_ver_key = f"{cart_base}_ver"
+    if cart_ver_key not in st.session_state:
+        st.session_state[cart_ver_key] = 0
+    cart_editor_key = f"{cart_base}_{st.session_state[cart_ver_key]}"
+
+    cart_col_cfg = {"Remove": st.column_config.CheckboxColumn("Remove", help="Check to remove from cart", default=False)}
+    edited_cart = st.data_editor(
+        cart_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config=cart_col_cfg,
+        key=cart_editor_key,
+    )
+
+    c_rm, c_clear_cart, _ = st.columns([1.2, 1.1, 6])
+    with c_rm:
+        if st.button("🗑️ Remove selected"):
+            # rows where Remove is True in the edited view correspond to indices
+            try:
+                to_remove_idx = edited_cart.index[edited_cart["Remove"] == True]
+            except Exception:
+                to_remove_idx = []
+            if len(to_remove_idx):
+                # map to keys
+                keys_to_remove = cart_df.loc[to_remove_idx, "__KEY__"].tolist()
+                st.session_state[cart_key] = cart_df.loc[~cart_df["__KEY__"].isin(keys_to_remove)].reset_index(drop=True)
+                st.session_state[cart_ver_key] += 1
+                st.rerun()
+    with c_clear_cart:
+        if st.button("🧼 Clear cart", disabled=cart_df.empty):
+            st.session_state[cart_key] = pd.DataFrame(columns=df.columns)
+            st.session_state[cart_ver_key] += 1
             st.rerun()
 
-    # ---------- Quote Request generation (selected rows) ----------
-    st.markdown("#### Quote Request (from selected rows)")
-    if selected_rows.empty:
-        st.caption("Select rows using the checkboxes to enable the quote download.")
+    # ---------- Quote Request (from CART) ----------
+    st.markdown("#### Quote Request (from cart)")
+    if st.session_state[cart_key].empty:
+        st.caption("Add items to the cart above to enable the quote download.")
     else:
-        # Determine vendor header
-        if vendor_col and vendor_col in selected_rows.columns:
-            unique_vendors = sorted(set(selected_rows[vendor_col].dropna().astype(str)))
-            v_header = unique_vendors[0] if len(unique_vendors) == 1 else "Multiple"
+        # Vendor header from cart
+        if vendor_col and vendor_col in st.session_state[cart_key].columns:
+            vendors = sorted(set(st.session_state[cart_key][vendor_col].dropna().astype(str)))
+            v_header = vendors[0] if len(vendors) == 1 else "Multiple"
         else:
             v_header = "Unknown"
 
         def build_single_doc() -> bytes:
             return quote_docx_bytes(
-                selected_rows, vendor=v_header, title_companies=title_companies, dataset_label=ds
+                st.session_state[cart_key],
+                vendor=v_header,
+                title_companies=title_companies,
+                dataset_label=ds
             )
 
         st.download_button(
