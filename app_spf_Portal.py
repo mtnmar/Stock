@@ -8,7 +8,7 @@
 # - Dates shown as YYYY-MM-DD (no time)
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
-# - NEW: Grid hides Rsvd/Ord/Company, has Select checkboxes
+# - NEW: Grid hides Rsvd/Ord/Company on-screen, has Select checkboxes
 # - NEW: Generate Quote Requests:
 #        • One Word per Vendor (ZIP)
 #        • One combined Word for all selected rows
@@ -225,7 +225,6 @@ def quote_docx_bytes(lines: pd.DataFrame, *, title: str, vendor: Optional[str]=N
         tbl = lines.reset_index(drop=True)
         tbl.insert(0, "Item", range(1, len(lines)+1))
 
-    # Make the doc
     heading = f"Quote Request — {vendor}" if vendor else title
     return to_docx_table_bytes(tbl, heading)
 
@@ -254,9 +253,10 @@ HIDE_COLS = {
     "po_outstanding": ["ID", "id", "Purchase Order ID", "Column2"],
 }
 
+# ---- "Data last updated" helper (GitHub commit time or local mtime) ----
 def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
     gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh and gh.get('repo') and gh.get('path')):
+    if gh and gh.get('repo') and gh.get('path'):
         try:
             import requests
             url = f"https://api.github.com/repos/{gh['repo']}/commits"
@@ -282,6 +282,7 @@ def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
 cfg = load_config()
 cfg = to_plain(cfg)
 
+# Auth (pin streamlit-authenticator==0.2.3)
 cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
@@ -301,6 +302,8 @@ else:
     st.sidebar.success(f"Logged in as {name}")
 
     db_path = resolve_db_path(cfg)
+
+    # Sidebar caption: only the "last updated" info (no DB path, no version)
     updated_label = get_data_last_updated(cfg, db_path)
     if updated_label:
         st.sidebar.caption(updated_label)
@@ -308,20 +311,24 @@ else:
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
 
+    # Dataset -> table name (radio)
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company ---
+    # --- Authorization by Company (case-insensitive username lookup + lenient company matching) ---
     all_companies_df = q(
         f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
         db_path=db_path
     )
     all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
+    # Case-insensitive username handling
     username_ci = str(username).casefold()
-    admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
+    admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
+    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
     is_admin = username_ci in admin_users_ci
 
+    # Case-insensitive lookup of user_companies
     uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
     uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
     allowed_cfg = uc_ci_map.get(username_ci, [])
@@ -330,17 +337,26 @@ else:
     allowed_cfg = [a for a in (allowed_cfg or [])]
 
     def norm(s: str) -> str:
+        # trim, collapse inner spaces, casefold for compare
         return " ".join(str(s).strip().split()).casefold()
 
-    db_map = {norm(c): c for c in all_companies}
+    # Build normalization map for DB company strings
+    db_map = {norm(c): c for c in all_companies}         # normalized -> DB original
     allowed_norm = {norm(a) for a in allowed_cfg}
     star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
 
     if is_admin or star_granted:
+        # Admins (or '*') see everything in the dataset
         allowed_set = set(all_companies)
     else:
+        # Prefer matches that actually exist in the dataset
         matches = {db_map[n] for n in allowed_norm if n in db_map}
-        allowed_set = matches if matches else set(allowed_cfg)
+        if matches:
+            allowed_set = matches
+        else:
+            # If none of the configured companies exist in this dataset now,
+            # still show the configured names; selection may yield 0 rows.
+            allowed_set = set(allowed_cfg)
 
     if not allowed_set:
         st.error("No companies configured for your account. Ask an admin to update your access.")
@@ -351,6 +367,7 @@ else:
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
 
+    # Dropdown: required choice (no default). Admins get an "All" option.
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1:
         select_options += [ADMIN_ALL]
@@ -417,7 +434,7 @@ else:
     # Date-only formatting
     df = strip_time(df, DATE_COLS.get(src, []))
 
-    # Preserve on-disk order, hide technical cols for *downloads*, not display tweaks
+    # Preserve on-disk order but hide IDs/technical columns for downloads
     cols_in_order = table_columns_in_order(db_path, src)
     hide_set = set(HIDE_COLS.get(src, []))
     cols_for_download = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
@@ -495,7 +512,6 @@ else:
                 for vname, gdf in vendor_list:
                     title = f"{ds} — {title_companies}"
                     doc_bytes = quote_docx_bytes(gdf, title=title, vendor=vname)
-                    # File name includes company and vendor
                     fname = f"Quote_{sanitize_filename(title_companies)}_{sanitize_filename(vname)}.docx"
                     zf.writestr(fname, doc_bytes)
             return buf.getvalue()
@@ -514,7 +530,6 @@ else:
                 mime="application/zip",
             )
         with c4:
-            # If exactly one vendor, also offer a single direct .docx w/ vendor in name; else a combined doc
             if len(vendor_list) == 1:
                 vname, gdf = vendor_list[0]
                 st.download_button(
