@@ -691,8 +691,9 @@ else:
             st.rerun()  # clear now
 
         # ---------- Standard downloads (EXCEL matches VISIBLE columns) ----------
-        # Excel uses visible table columns, excluding the checkbox "Select"
-        excel_df = df_display.drop(columns=["Select"], errors="ignore")
+        # Excel uses the edited grid (includes the "Select" checkbox column)
+        excel_df = edited.copy()
+
         # Word keeps the original download column set (as before)
         df_download = df[cols_for_download]
 
