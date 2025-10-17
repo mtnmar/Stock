@@ -4,15 +4,14 @@
 # - Login (streamlit-authenticator)
 # - Authorize & filter by Company (not Location)
 # - Uses raw tables: restock, po_outstanding (no views)
-# - Preserves exact DB column order in grid & downloads
+# - Preserves exact column order (DB/Parquet) in grid & downloads
 # - Dates shown as YYYY-MM-DD (no time)
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
-# - Shopping cart flow using forms (edit without refresh):
-#     • Results grid: Select → 🛒 Add selected to cart  |  🧹 Clear selections
-#     • Cart: edit Qty → 💾 Save Qty  |  🗑️ Remove  |  🧼 Clear cart
-# - Cart enforces a single Vendor; quote header always uses that Vendor.
+# - Shopping cart flow (forms): Select → Add to Cart; edit Qty; Remove; Clear
+# - Cart enforces a single Vendor; quote header always uses that Vendor
 # - Quote table: Part Number | Part Name | Qty + 10 blank rows
+# - **Auto Parquet engine** if files exist; else SQLite
 #
 # requirements.txt (minimum):
 #   streamlit>=1.37
@@ -23,13 +22,14 @@
 #   python-docx>=1.1
 #   pyyaml>=6.0
 #   requests>=2.31
+#   pyarrow>=17.0   # for Parquet (or fastparquet>=2024.5.0)
 
 from __future__ import annotations
-import os, io, sqlite3, textwrap, re, hashlib
+import os, io, sqlite3, textwrap, re, hashlib, time
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Optional, Iterable, List, Tuple
+from typing import Optional, Iterable, List, Tuple, Dict
 import pandas as pd
 import streamlit as st
 import yaml
@@ -53,7 +53,8 @@ except Exception:
 st.set_page_config(page_title="SPF PO Portal", page_icon="📦", layout="wide")
 
 # ---------- Defaults & config ----------
-DEFAULT_DB = "maintainx_po.db"   # local fallback; Cloud will use secrets→GitHub
+DEFAULT_DB = "maintainx_po.db"   # local fallback; Cloud may use secrets→GitHub
+HERE = Path(__file__).resolve().parent
 
 CONFIG_TEMPLATE_YAML = """
 credentials:
@@ -75,9 +76,11 @@ access:
 
 settings:
   db_path: ""
+  # Optional direct Parquet paths:
+  # parquet:
+  #   restock: /path/to/restock.parquet
+  #   po_outstanding: /path/to/po_outstanding.parquet
 """
-
-HERE = Path(__file__).resolve().parent
 
 # ---------- helpers ----------
 def to_plain(obj):
@@ -86,6 +89,24 @@ def to_plain(obj):
     if isinstance(obj, (list, tuple)):
         return [to_plain(x) for x in obj]
     return obj
+
+def load_config() -> dict:
+    if "app_config" in st.secrets:
+        return to_plain(st.secrets["app_config"])
+    if "app_config_yaml" in st.secrets:
+        try:
+            return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
+        except Exception as e:
+            st.error(f"Invalid YAML in app_config_yaml secret: {e}")
+            return {}
+    cfg_file = HERE / "app_config.yaml"
+    if cfg_file.exists():
+        try:
+            return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            st.error(f"Invalid YAML in app_config.yaml: {e}")
+            return {}
+    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
 
 def resolve_db_path(cfg: dict) -> str:
     yaml_db = (cfg or {}).get('settings', {}).get('db_path')
@@ -124,25 +145,63 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     out.write_bytes(r.content)
     return str(out)
 
-def load_config() -> dict:
-    if "app_config" in st.secrets:
-        return to_plain(st.secrets["app_config"])
-    if "app_config_yaml" in st.secrets:
+# ---------- Engine detection (Parquet vs SQLite) ----------
+def detect_parquet_paths(cfg: dict) -> Dict[str, Optional[Path]]:
+    # Priority: explicit config → env vars → dir env → app folder
+    p_cfg = (cfg.get('settings', {}) or {}).get('parquet', {}) or {}
+    def as_path(x): 
         try:
-            return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
-        except Exception as e:
-            st.error(f"Invalid YAML in app_config_yaml secret: {e}")
-            return {}
-    cfg_file = HERE / "app_config.yaml"
-    if cfg_file.exists():
-        try:
-            return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
-        except Exception as e:
-            st.error(f"Invalid YAML in app_config.yaml: {e}")
-            return {}
-    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
+            return Path(str(x)).expanduser().resolve()
+        except Exception:
+            return None
 
-# ---- caching helpers for speed ----
+    restock = as_path(p_cfg.get('restock')) if p_cfg else None
+    po_out   = as_path(p_cfg.get('po_outstanding')) if p_cfg else None
+
+    if not restock:
+        env = os.environ.get('SPF_RESTOCK_PARQUET')
+        restock = as_path(env) if env else None
+    if not po_out:
+        env = os.environ.get('SPF_PO_PARQUET')
+        po_out = as_path(env) if env else None
+
+    base = os.environ.get('SPF_PARQUET_DIR')
+    if base and not restock:
+        restock = as_path(Path(base) / "restock.parquet")
+    if base and not po_out:
+        po_out = as_path(Path(base) / "po_outstanding.parquet")
+
+    if not restock:
+        cand = HERE / "restock.parquet"
+        restock = cand if cand.exists() else None
+    if not po_out:
+        cand = HERE / "po_outstanding.parquet"
+        po_out = cand if cand.exists() else None
+
+    # ensure they exist
+    if restock and not restock.exists():
+        restock = None
+    if po_out and not po_out.exists():
+        po_out = None
+    return {"restock": restock, "po_outstanding": po_out}
+
+def _filesig(p: Path) -> int:
+    try:
+        stt = p.stat()
+        return (int(stt.st_mtime_ns) ^ (stt.st_size << 13)) & 0xFFFFFFFFFFFF
+    except Exception:
+        return 0
+
+@st.cache_data(show_spinner=False)
+def read_parquet_cached(path_str: str, sig: int) -> pd.DataFrame:
+    # engine auto; pyarrow preferred
+    return pd.read_parquet(path_str)
+
+def parquet_available_for(src: str, pq_paths: Dict[str, Optional[Path]]) -> Optional[Path]:
+    p = pq_paths.get(src)
+    return p if p and p.exists() else None
+
+# ---------- SQLite helpers with caching ----------
 def _db_sig(db_path: str) -> int:
     try:
         return Path(db_path).stat().st_mtime_ns
@@ -249,11 +308,6 @@ def qty_series_for_lines(lines: pd.DataFrame) -> pd.Series:
     return q
 
 def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_companies: str, dataset_label: str) -> bytes:
-    """
-    Build the requested Quote doc:
-      Header: Vendor + "Quote Request — YYYY-MM-DD"
-      Table: Part Number | Part Name | Qty + 10 blank rows
-    """
     pn_col   = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
     name_col = pick_first_col(lines, ["Name","Line Name","Description","Part Name","Item Name"])
 
@@ -262,7 +316,6 @@ def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_compan
     out["Part Name"]   = lines[name_col].astype(str) if name_col else ""
     out["Qty"]         = qty_series_for_lines(lines)
 
-    # Append 10 blank rows
     blanks = pd.DataFrame([{"Part Number":"", "Part Name":"", "Qty":""} for _ in range(10)])
     out_final = pd.concat([out.reset_index(drop=True), blanks], ignore_index=True)
 
@@ -315,30 +368,16 @@ HIDE_COLS = {
     "po_outstanding": ["ID", "id", "Purchase Order ID", "Column2"],
 }
 
-# ---- "Data last updated" helper (GitHub commit time or local mtime) ----
-def get_data_last_updated(cfg: dict, db_path: str) -> str | None:
-    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh and gh.get('repo') and gh.get('path'):
+# ---- "Data last updated" helper (show source & mtime) ----
+def label_for_source(engine: str, path: Optional[str]) -> str:
+    if engine == "parquet" and path:
         try:
-            import requests
-            url = f"https://api.github.com/repos/{gh['repo']}/commits"
-            params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
-            headers = {"Accept": "application/vnd.github+json"}
-            if gh.get("token"):
-                headers["Authorization"] = f"token {gh['token']}"
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-            r.raise_for_status()
-            iso = r.json()[0]["commit"]["committer"]["date"]
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
-            return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
+            ts = Path(path).stat().st_mtime
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return f"Engine: Parquet • Updated: {dt.strftime('%Y-%m-%d %H:%M UTC')}"
         except Exception:
-            pass
-    try:
-        ts = Path(db_path).stat().st_mtime
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
-    except Exception:
-        return None
+            return "Engine: Parquet"
+    return "Engine: SQLite"
 
 # ---------- App ----------
 cfg = load_config()
@@ -363,12 +402,15 @@ else:
     auth.logout('Logout', 'sidebar')
     st.sidebar.success(f"Logged in as {name}")
 
+    # Detect data sources
     db_path = resolve_db_path(cfg)
+    pq_paths = detect_parquet_paths(cfg)
 
-    # Sidebar caption: only the "last updated" info (no DB path, no version)
-    updated_label = get_data_last_updated(cfg, db_path)
-    if updated_label:
-        st.sidebar.caption(updated_label)
+    # Sidebar caption: source engine
+    st.sidebar.caption(label_for_source(
+        "parquet" if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else "sqlite",
+        str(pq_paths.get("restock") or pq_paths.get("po_outstanding")) if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else None
+    ))
 
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
@@ -376,14 +418,29 @@ else:
     # Dataset -> table name (radio)
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
+    pq_path = parquet_available_for(src, pq_paths)
 
-    # --- Authorization by Company ---
-    all_companies_df = q(
-        f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
-        db_path=db_path
-    )
-    all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
+    # --- Authorization by Company (needs list of companies) ---
+    if pq_path:
+        # Parquet: read columns and distinct companies quickly
+        t0 = time.perf_counter()
+        df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
+        # ensure original column order preserved
+        cols_in_db = list(df_all.columns)
+        # distinct companies
+        comp_col = "Company" if "Company" in df_all.columns else None
+        all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
+        t1 = time.perf_counter()
+    else:
+        # SQLite path for companies only
+        all_companies_df = q(
+            f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
+            db_path=db_path
+        )
+        all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
+        cols_in_db = table_columns_in_order(db_path, src)
 
+    # auth scopes
     username_ci = str(username).casefold()
     admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
     is_admin = username_ci in admin_users_ci
@@ -410,7 +467,7 @@ else:
 
     if not allowed_set:
         st.error("No companies configured for your account. Ask an admin to update your access.")
-        with st.expander("Company values present in DB"):
+        with st.expander("Company values present in data"):
             st.write(sorted(all_companies))
         st.stop()
 
@@ -435,11 +492,8 @@ else:
         chosen_companies = [chosen]
         title_companies = chosen
 
-    # --- Query data ---
-    cols_in_db = table_columns_in_order(db_path, src)
+    # --- Determine vendor column for search / grouping ---
     cols_lower = {c.lower(): c for c in cols_in_db}
-
-    # Detect vendor column
     vendor_col = None
     if src == 'restock':
         if 'vendors' in cols_lower:
@@ -450,40 +504,79 @@ else:
         if 'vendor' in cols_lower:
             vendor_col = cols_lower['vendor']
 
-    # Search (kept simple; form not needed here)
+    # Search UI
     if ds == 'RE-STOCK':
         label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
         search = st.sidebar.text_input(label)
         if vendor_col:
+            # for SQL only
             search_clause = f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)"
             search_fields = 3
         else:
             search_clause = "([Part Numbers] LIKE ? OR [Name] LIKE ?)"
             search_fields = 2
-        order_by = "[Company], [Name]"
+        order_cols = [c for c in ["Company", "Name"] if c in cols_in_db]
     else:
         search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
         search_clause = "([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)"
         search_fields = 4
-        order_by = "[Company], date([Created On]) ASC, [Purchase Order #]"
+        # We'll sort by Created On date if present
+        order_cols = [c for c in ["Company", "Created On", "Purchase Order #"] if c in cols_in_db]
 
-    # WHERE
-    ph = ','.join(['?'] * len(chosen_companies))
-    where = [f"[Company] IN ({ph})"]
-    params: list = list(chosen_companies)
-    if search:
-        like = f"%{search}%"
-        where.append(search_clause)
-        params += [like] * search_fields
+    # --- Load filtered data (Parquet vs SQLite) ---
+    if pq_path:
+        # Parquet path: filter in-memory
+        t2 = time.perf_counter()
+        df = df_all.copy()
+        # Company filter
+        if "Company" in df.columns:
+            df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
+        # Search filter
+        if search:
+            s = str(search)
+            if src == 'restock':
+                cols = ["Part Numbers", "Name"]
+                if vendor_col: cols.append(vendor_col)
+            else:
+                cols = ["Purchase Order #", "Vendor", "Part Number", "Line Name"]
+            ok = pd.Series(False, index=df.index)
+            for c in cols:
+                if c in df.columns:
+                    ok = ok | df[c].astype(str).str.contains(s, case=False, regex=False, na=False)
+            df = df[ok]
+        # Sort
+        if ds == 'RE-STOCK':
+            df = df.sort_values(order_cols) if order_cols else df
+        else:
+            if "Created On" in df.columns:
+                co = pd.to_datetime(df["Created On"], errors="coerce")
+                # sort by Company, Created On ascending, Purchase Order #
+                sort_cols = []
+                if "Company" in df.columns: sort_cols.append("Company")
+                sort_cols.append(co)
+                if "Purchase Order #" in df.columns: sort_cols.append("Purchase Order #")
+                df = df.assign(_co=co).sort_values(["Company","_co","Purchase Order #"] if "Company" in df.columns and "Purchase Order #" in df.columns else ["_co"]).drop(columns=["_co"])
+        t3 = time.perf_counter()
+        # Sidebar timing hints (optional): uncomment if useful
+        # st.sidebar.caption(f"Parquet: load {(t1-t0)*1000:.0f} ms, filter {(t3-t2)*1000:.0f} ms")
+    else:
+        # SQLite path: build WHERE and query the minimal slice
+        ph = ','.join(['?'] * len(chosen_companies))
+        where = [f"[Company] IN ({ph})"]
+        params: list = list(chosen_companies)
+        if search:
+            like = f"%{search}%"
+            where.append(search_clause)
+            params += [like] * search_fields
+        where_sql = " AND ".join(where)
+        order_by = "[Company], [Name]" if ds == "RE-STOCK" else "[Company], date([Created On]) ASC, [Purchase Order #]"
+        sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY {order_by}"
+        df = q(sql, tuple(params), db_path=db_path)
 
-    where_sql = " AND ".join(where)
-    sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY {order_by}"
-    df = q(sql, tuple(params), db_path=db_path)
-
-    # Date-only formatting
+    # Date-only formatting (post-filter)
     df = strip_time(df, DATE_COLS.get(src, []))
 
-    # Attach keys for cart
+    # ---- Attach row key for cart persistence ----
     KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
     def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
         df_in = df_in.copy()
@@ -545,44 +638,37 @@ else:
     selected_rows = df.loc[selected_idx] if len(selected_idx) else df.iloc[0:0]
 
     # ---- Cart state (per dataset+company) ----
-    cart_key = f"cart_{src}_{hashlib.md5(('|'.join(chosen_companies)).encode()).hexdigest()}"
+    cart_key = f"cart_{src}_{hashlib.md5(('|'.join([str(x) for x in chosen_companies])).encode()).hexdigest()}"
     if cart_key not in st.session_state:
         st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
 
     # --- Add to cart (enforce single vendor) ---
     if add_clicked and not selected_rows.empty:
         add_df = selected_rows.copy()
-        # Initialize qty defaults
         add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
 
         if vendor_col:
-            # Normalize vendor strings for compare
             sel_vendors = sorted(set(add_df[vendor_col].dropna().astype(str).str.strip()))
             cart_df = st.session_state[cart_key]
             cart_vendors = sorted(set(cart_df[vendor_col].dropna().astype(str).str.strip())) if (not cart_df.empty and vendor_col in cart_df.columns) else []
 
             if not cart_vendors:
-                # Cart empty (or without vendor); if multiple vendors in selection, pick first and filter
                 if len(sel_vendors) > 1:
                     chosen_vendor = sel_vendors[0]
                     add_df = add_df[add_df[vendor_col].astype(str).str.strip() == chosen_vendor]
                     st.info(f"Cart is per-vendor. Added only Vendor '{chosen_vendor}' from selection.")
-                else:
-                    chosen_vendor = sel_vendors[0] if sel_vendors else "Unknown"
-                # proceed to add
             else:
-                # Cart already has a vendor; accept only that vendor
                 chosen_vendor = cart_vendors[0]
                 before = len(add_df)
                 add_df = add_df[add_df[vendor_col].astype(str).str.strip() == chosen_vendor]
                 skipped = before - len(add_df)
                 if skipped > 0:
                     st.warning(f"Cart locked to Vendor '{chosen_vendor}'. Skipped {skipped} item(s) from other vendor(s).")
-        # Merge + dedupe by __KEY__
+
         merged = pd.concat([st.session_state[cart_key], add_df], ignore_index=True)
         st.session_state[cart_key] = merged.drop_duplicates(subset="__KEY__", keep="first").reset_index(drop=True)
         st.success(f"Added {len(add_df)} item(s) to cart.")
-        st.rerun()  # immediate reflect
+        st.rerun()  # reflect immediately
 
     if clear_sel_clicked:
         st.session_state[ver_key] += 1
@@ -609,13 +695,25 @@ else:
     cart_df: pd.DataFrame = st.session_state[cart_key]
     st.markdown(f"#### Cart ({len(cart_df)} item{'s' if len(cart_df)!=1 else ''})")
 
-    # ensure internals
     if cart_df.empty:
         cart_df = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
         st.session_state[cart_key] = cart_df
     else:
         if "__KEY__" not in cart_df.columns:
             cart_df = cart_df.copy()
+            # reattach keys based on current visible columns
+            KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
+            def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
+                df_in = df_in.copy()
+                key_col = next((c for c in KEY_COL_CANDIDATES if c in df_in.columns), None)
+                if key_col:
+                    df_in["__KEY__"] = df_in[key_col].astype(str)
+                    return df_in
+                cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN","Name","Line Name","Description","Vendor","Vendors","Company","Created On"] if c in df_in.columns]
+                if not cols: cols = list(df_in.columns)
+                s = df_in[cols].astype(str).agg("|".join, axis=1)
+                df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+                return df_in
             cart_df = attach_row_key(cart_df)
         if "__QTY__" not in cart_df.columns:
             cart_df["__QTY__"] = compute_qty_min_minus_stock(cart_df)
@@ -683,23 +781,22 @@ else:
                 ~st.session_state[cart_key]["__KEY__"].isin(keys_to_remove)
             ].reset_index(drop=True)
             st.session_state[cart_ver_key] += 1
-            st.rerun()  # reflect immediately
+            st.rerun()
 
     if clear_cart_btn:
         st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns) + ["__QTY__"])
         st.session_state[cart_ver_key] += 1
-        st.rerun()  # reflect immediately
+        st.rerun()
 
     # ---------- Quote Request (from CART) ----------
     st.markdown("#### Quote Request (from cart)")
     if st.session_state[cart_key].empty:
         st.caption("Add items to the cart above to enable the quote download.")
     else:
-        # Enforce single vendor at quote time, too (safety)
         if vendor_col and vendor_col in st.session_state[cart_key].columns:
             vendors = sorted(set(st.session_state[cart_key][vendor_col].dropna().astype(str).str.strip()))
             if len(vendors) != 1:
-                st.error("Cart has multiple vendors. Please remove items so only one vendor remains before generating the quote.")
+                st.error("Cart has multiple vendors. Please keep only one vendor before generating the quote.")
                 can_download = False
                 v_header = "Multiple"
             else:
@@ -726,11 +823,11 @@ else:
             )
         else:
             st.caption("Tip: Use the Cart’s 🗑️ Remove or 🧼 Clear cart to fix the vendor mix.")
+
     # ---------- Config template (admins only) ----------
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
-
 
 
 
