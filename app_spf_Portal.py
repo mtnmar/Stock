@@ -11,6 +11,7 @@
 # - Shopping cart flow (forms): Select → Add to Cart; edit Qty; Remove; Clear
 # - Cart enforces a single Vendor; quote header always uses that Vendor
 # - Quote table: Part Number | Part Name | Qty + 10 blank rows
+# - **Qty default = max(Min − InStk, 0)**; users can edit in cart
 # - **Auto Parquet engine** if files exist; else SQLite
 #
 # requirements.txt (minimum):
@@ -22,7 +23,7 @@
 #   python-docx>=1.1
 #   pyyaml>=6.0
 #   requests>=2.31
-#   pyarrow>=17.0   # for Parquet (or fastparquet>=2024.5.0)
+#   pyarrow>=17.0   # or fastparquet>=2024.5.0
 
 from __future__ import annotations
 import os, io, sqlite3, textwrap, re, hashlib, time
@@ -147,9 +148,8 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
 
 # ---------- Engine detection (Parquet vs SQLite) ----------
 def detect_parquet_paths(cfg: dict) -> Dict[str, Optional[Path]]:
-    # Priority: explicit config → env vars → dir env → app folder
     p_cfg = (cfg.get('settings', {}) or {}).get('parquet', {}) or {}
-    def as_path(x): 
+    def as_path(x):
         try:
             return Path(str(x)).expanduser().resolve()
         except Exception:
@@ -178,7 +178,6 @@ def detect_parquet_paths(cfg: dict) -> Dict[str, Optional[Path]]:
         cand = HERE / "po_outstanding.parquet"
         po_out = cand if cand.exists() else None
 
-    # ensure they exist
     if restock and not restock.exists():
         restock = None
     if po_out and not po_out.exists():
@@ -194,7 +193,6 @@ def _filesig(p: Path) -> int:
 
 @st.cache_data(show_spinner=False)
 def read_parquet_cached(path_str: str, sig: int) -> pd.DataFrame:
-    # engine auto; pyarrow preferred
     return pd.read_parquet(path_str)
 
 def parquet_available_for(src: str, pq_paths: Dict[str, Optional[Path]]) -> Optional[Path]:
@@ -225,6 +223,22 @@ def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
 
 def table_columns_in_order(db_path: str, table: str) -> list[str]:
     return table_columns_in_order_cached(db_path, table, _db_sig(db_path))
+
+# ---- Row key helper (shared) ----
+KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
+def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
+    df_in = df_in.copy()
+    key_col = next((c for c in KEY_COL_CANDIDATES if c in df_in.columns), None)
+    if key_col:
+        df_in["__KEY__"] = df_in[key_col].astype(str)
+        return df_in
+    cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN",
+                        "Name","Line Name","Description",
+                        "Vendor","Vendors","Company","Created On"] if c in df_in.columns]
+    if not cols: cols = list(df_in.columns)
+    s = df_in[cols].astype(str).agg("|".join, axis=1)
+    df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+    return df_in
 
 # ---- Excel/Word export helpers ----
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
@@ -275,26 +289,50 @@ def pick_first_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]
     return None
 
 def compute_qty_min_minus_stock(df: pd.DataFrame) -> pd.Series:
-    """Exact Min - InStock (no clamping, no fallback). Blank if columns missing."""
-    min_candidates: List[str] = ["Min", "Minimum", "Min Qty", "Minimum Qty", "Reorder Point", "Min Level"]
-    instock_candidates: List[str] = [
-        "Quantity in Stock", "Available Quantity", "Qty in Stock", "QOH",
-        "On Hand", "In Stock", "Available"
+    """
+    Compute default Qty as max(Min - InStock, 0).
+    Supports many column name variants, including 'InStk'.
+    Returns stringified integers (no .0); blank if columns missing.
+    """
+    min_candidates: List[str] = [
+        "Min", "Minimum", "Min Qty", "Minimum Qty", "Reorder Point", "Min Level"
     ]
-    min_col = pick_first_col(df, min_candidates)
-    stk_col = pick_first_col(df, instock_candidates)
+    instock_candidates: List[str] = [
+        "InStk", "Instk", "In Stock", "On Hand", "QOH",
+        "Quantity in Stock", "Available Quantity", "Qty in Stock",
+        "Available", "Stock", "Qty On Hand", "On-Hand", "OnHand", "In_Stock"
+    ]
+
+    def pick_first(df_cols: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
+        for c in candidates:
+            if c in df_cols:
+                return c
+        return None
+
+    min_col = pick_first(df.columns, min_candidates)
+    stk_col = pick_first(df.columns, instock_candidates)
 
     if not (min_col and stk_col):
         return pd.Series([""] * len(df), index=df.index, dtype="object")
 
     m = pd.to_numeric(df[min_col], errors="coerce")
     s = pd.to_numeric(df[stk_col], errors="coerce")
-    diff = m - s
-    out = diff.apply(lambda x: ("" if pd.isna(x) else (str(int(x)) if float(x).is_integer() else str(x))))
-    return out.astype("object")
+
+    diff = (m - s).clip(lower=0)  # clamp negatives to 0
+
+    def fmt(x):
+        if pd.isna(x):
+            return ""
+        xf = float(x)
+        return str(int(xf)) if xf.is_integer() else str(xf)
+
+    return diff.apply(fmt).astype("object")
 
 def qty_series_for_lines(lines: pd.DataFrame) -> pd.Series:
-    """Prefer user-edited __QTY__; fallback to computed Min-InStk."""
+    """
+    Prefer user-edited __QTY__; where blank/missing, fill with compute_qty_min_minus_stock(lines).
+    Always return strings ('' for missing).
+    """
     if "__QTY__" in lines.columns:
         q = lines["__QTY__"].copy()
     else:
@@ -304,8 +342,13 @@ def qty_series_for_lines(lines: pd.DataFrame) -> pd.Series:
     if need.any():
         q_def = compute_qty_min_minus_stock(lines)
         q = q.where(~need, q_def)
-    q = q.apply(lambda x: "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
-    return q
+
+    def to_str(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return ""
+        return str(x)
+
+    return q.apply(to_str).astype("object")
 
 def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_companies: str, dataset_label: str) -> bytes:
     pn_col   = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
@@ -422,17 +465,11 @@ else:
 
     # --- Authorization by Company (needs list of companies) ---
     if pq_path:
-        # Parquet: read columns and distinct companies quickly
-        t0 = time.perf_counter()
         df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
-        # ensure original column order preserved
         cols_in_db = list(df_all.columns)
-        # distinct companies
         comp_col = "Company" if "Company" in df_all.columns else None
         all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
-        t1 = time.perf_counter()
     else:
-        # SQLite path for companies only
         all_companies_df = q(
             f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
             db_path=db_path
@@ -509,7 +546,6 @@ else:
         label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
         search = st.sidebar.text_input(label)
         if vendor_col:
-            # for SQL only
             search_clause = f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)"
             search_fields = 3
         else:
@@ -520,13 +556,10 @@ else:
         search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
         search_clause = "([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)"
         search_fields = 4
-        # We'll sort by Created On date if present
         order_cols = [c for c in ["Company", "Created On", "Purchase Order #"] if c in cols_in_db]
 
     # --- Load filtered data (Parquet vs SQLite) ---
     if pq_path:
-        # Parquet path: filter in-memory
-        t2 = time.perf_counter()
         df = df_all.copy()
         # Company filter
         if "Company" in df.columns:
@@ -550,17 +583,11 @@ else:
         else:
             if "Created On" in df.columns:
                 co = pd.to_datetime(df["Created On"], errors="coerce")
-                # sort by Company, Created On ascending, Purchase Order #
-                sort_cols = []
-                if "Company" in df.columns: sort_cols.append("Company")
-                sort_cols.append(co)
-                if "Purchase Order #" in df.columns: sort_cols.append("Purchase Order #")
-                df = df.assign(_co=co).sort_values(["Company","_co","Purchase Order #"] if "Company" in df.columns and "Purchase Order #" in df.columns else ["_co"]).drop(columns=["_co"])
-        t3 = time.perf_counter()
-        # Sidebar timing hints (optional): uncomment if useful
-        # st.sidebar.caption(f"Parquet: load {(t1-t0)*1000:.0f} ms, filter {(t3-t2)*1000:.0f} ms")
+                if "Company" in df.columns and "Purchase Order #" in df.columns:
+                    df = df.assign(_co=co).sort_values(["Company","_co","Purchase Order #"]).drop(columns=["_co"])
+                else:
+                    df = df.assign(_co=co).sort_values(["_co"]).drop(columns=["_co"])
     else:
-        # SQLite path: build WHERE and query the minimal slice
         ph = ','.join(['?'] * len(chosen_companies))
         where = [f"[Company] IN ({ph})"]
         params: list = list(chosen_companies)
@@ -577,19 +604,6 @@ else:
     df = strip_time(df, DATE_COLS.get(src, []))
 
     # ---- Attach row key for cart persistence ----
-    KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
-    def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
-        df_in = df_in.copy()
-        key_col = next((c for c in KEY_COL_CANDIDATES if c in df_in.columns), None)
-        if key_col:
-            df_in["__KEY__"] = df_in[key_col].astype(str)
-            return df_in
-        cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN","Name","Line Name","Description","Vendor","Vendors","Company","Created On"] if c in df_in.columns]
-        if not cols: cols = list(df_in.columns)
-        s = df_in[cols].astype(str).agg("|".join, axis=1)
-        df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
-        return df_in
-
     df = attach_row_key(df)
 
     # Downloads frame (hide IDs + internals)
@@ -700,20 +714,6 @@ else:
         st.session_state[cart_key] = cart_df
     else:
         if "__KEY__" not in cart_df.columns:
-            cart_df = cart_df.copy()
-            # reattach keys based on current visible columns
-            KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
-            def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
-                df_in = df_in.copy()
-                key_col = next((c for c in KEY_COL_CANDIDATES if c in df_in.columns), None)
-                if key_col:
-                    df_in["__KEY__"] = df_in[key_col].astype(str)
-                    return df_in
-                cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN","Name","Line Name","Description","Vendor","Vendors","Company","Created On"] if c in df_in.columns]
-                if not cols: cols = list(df_in.columns)
-                s = df_in[cols].astype(str).agg("|".join, axis=1)
-                df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
-                return df_in
             cart_df = attach_row_key(cart_df)
         if "__QTY__" not in cart_df.columns:
             cart_df["__QTY__"] = compute_qty_min_minus_stock(cart_df)
