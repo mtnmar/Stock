@@ -1,30 +1,34 @@
-# app_config.yaml — place next to app_spf_portal.py (DON'T COMMIT REAL SECRETS)
-# Copy this to app_config.yaml and replace the placeholders.
+# app_config.yaml
 credentials:
   usernames:
     brad:
       name: Brad
       email: brad@example.com
-      # Replace with a bcrypt hash (see hash_passwords.py). Do NOT use plain text.
       password: "$2b$12$.n87oFQoP03GYkzoQUFGr.Ni0csX626Q7FhUuEmVNH4GniOwW9TBe"
     demo:
       name: Demo User
       email: demo@example.com
-      # bcrypt for password 'demo' (example; replace in real file)
       password: "$2b$12$d9r3v4j3K2o2uI6dFoyVbOa3YV1Aq8p2qTj6kQy0iv8y2dQk6gV2W"
 
 cookie:
-  name: spf_po_portal
+  name: spf_po_portal          # keep your existing cookie name if you prefer
   key: change_me_in_yaml
   expiry_days: 7
 
 access:
   admin_usernames: [brad]
-  # Map usernames to allowed Location2 codes. '*' means all locations.
-  user_locations:
+  # Map usernames to allowed *Company* values. '*' means all companies.
+  user_companies:
     brad: ['*']
     demo: ['*']
+    # example if you want to restrict:
+    # user1: ["Acme Co", "North Division"]
 
 settings:
-  # If left blank, the app will use the hard-coded default path in the code.
+  # Leave blank to use default SQLite or Parquet auto-detect
   db_path: ""
+
+  # OPTIONAL: hard-wire Parquet files (faster). Remove if you prefer env vars or auto-detect.
+  parquet:
+    restock: "/absolute/path/to/restock.parquet"
+    po_outstanding: "/absolute/path/to/po_outstanding.parquet"
