@@ -9,7 +9,7 @@
 # - Hides ID columns from grid & downloads
 # - Downloads: Excel (.xlsx) and Word (.docx)
 # - Grid hides Rsvd/Ord/Company on-screen, has Select checkboxes
-# - Quote per Vendor (ZIP) or Single combined Word from selected rows
+# - Quote from selected rows: single Word doc (no ZIP)
 # - Quote table: Part Number | Part Name | Qty (Min-InStk) + 10 blank rows
 #
 # requirements.txt (minimum):
@@ -23,7 +23,7 @@
 #   requests>=2.31
 
 from __future__ import annotations
-import os, io, sqlite3, textwrap, re, zipfile
+import os, io, sqlite3, textwrap, re
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -199,7 +199,7 @@ def pick_first_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]
     return None
 
 def compute_qty_min_minus_stock(df: pd.DataFrame) -> pd.Series:
-    """Return a numeric Series for Min - InStock (>=0), with robust column name detection."""
+    """Exact Min - InStock (no clamping, no fallback). Blank if columns missing."""
     min_candidates: List[str] = ["Min", "Minimum", "Min Qty", "Minimum Qty", "Reorder Point", "Min Level"]
     instock_candidates: List[str] = [
         "Quantity in Stock", "Available Quantity", "Qty in Stock", "QOH",
@@ -208,21 +208,16 @@ def compute_qty_min_minus_stock(df: pd.DataFrame) -> pd.Series:
     min_col = pick_first_col(df, min_candidates)
     stk_col = pick_first_col(df, instock_candidates)
 
-    qty = pd.Series([None] * len(df), index=df.index, dtype="float")
-    if min_col and stk_col:
-        m = pd.to_numeric(df[min_col], errors="coerce")
-        s = pd.to_numeric(df[stk_col], errors="coerce")
-        diff = (m - s).fillna(0)
-        qty = diff.clip(lower=0)
-    else:
-        # graceful fallback to typical request qty columns if Min/InStock not present
-        fallback = pick_first_col(df, [
-            "Qty to Order", "Quantity to Order", "Order Qty",
-            "Quantity Requested", "Qty Requested", "Qty Ordered", "Qty", "Quantity"
-        ])
-        if fallback:
-            qty = pd.to_numeric(df[fallback], errors="coerce").clip(lower=0)
-    return qty
+    if not (min_col and stk_col):
+        return pd.Series([""] * len(df), index=df.index, dtype="object")
+
+    m = pd.to_numeric(df[min_col], errors="coerce")
+    s = pd.to_numeric(df[stk_col], errors="coerce")
+    diff = m - s
+    # Nice display: integers without .0, else as-is
+    out = diff.apply(lambda x: ("" if pd.isna(x) else (str(int(x)) if float(x).is_integer() else str(x))))
+    out = out.astype("object")
+    return out
 
 def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_companies: str, dataset_label: str) -> bytes:
     """
@@ -230,20 +225,14 @@ def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_compan
       Header: Vendor + "Quote Request — YYYY-MM-DD"
       Table: Part Number | Part Name | Qty (Min-InStk) + 10 blank rows
     """
-    # detect source columns
-    pn_col  = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
-    name_col= pick_first_col(lines, ["Name","Line Name","Description","Part Name","Item Name"])
+    pn_col   = pick_first_col(lines, ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
+    name_col = pick_first_col(lines, ["Name","Line Name","Description","Part Name","Item Name"])
 
-    # Build visible frame
+    # Visible frame
     out = pd.DataFrame(index=lines.index)
     out["Part Number"] = lines[pn_col].astype(str) if pn_col else ""
     out["Part Name"]   = lines[name_col].astype(str) if name_col else ""
-
-    qty_series = compute_qty_min_minus_stock(lines)
-    # format as int where possible, else plain string
-    qty_fmt = qty_series.round(0).astype("Int64").astype(object)
-    qty_fmt = qty_fmt.where(qty_fmt.notna(), "")
-    out["Qty (Min-InStk)"] = qty_fmt
+    out["Qty (Min-InStk)"] = compute_qty_min_minus_stock(lines)
 
     # Append 10 blank rows
     blanks = pd.DataFrame([{"Part Number":"", "Part Name":"", "Qty (Min-InStk)":""} for _ in range(10)])
@@ -254,15 +243,12 @@ def quote_docx_bytes(lines: pd.DataFrame, *, vendor: Optional[str], title_compan
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(10)
 
-    today = datetime.now().date().isoformat()  # date only
-    # Header content
+    today = datetime.now().date().isoformat()
     vtxt = vendor if (vendor and str(vendor).strip()) else "Unknown"
     doc.add_paragraph(f"Vendor: {vtxt}")
     doc.add_heading(f"Quote Request — {today}", level=1)
-    # Optional context line
     doc.add_paragraph(f"{dataset_label} — {title_companies}")
 
-    # Table
     rows, cols = len(out_final) + 1, len(out_final.columns)
     tbl = doc.add_table(rows=rows, cols=cols)
     tbl.style = 'Table Grid'
@@ -352,7 +338,7 @@ else:
 
     db_path = resolve_db_path(cfg)
 
-    # Sidebar caption: only the "last updated" info (no DB path, no version)
+    # Sidebar caption: only the "last updated" info
     updated_label = get_data_last_updated(cfg, db_path)
     if updated_label:
         st.sidebar.caption(updated_label)
@@ -360,7 +346,7 @@ else:
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
 
-    # Dataset -> table name (radio)
+    # Dataset -> table name
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
@@ -426,7 +412,7 @@ else:
     cols_in_db = table_columns_in_order(db_path, src)
     cols_lower = {c.lower(): c for c in cols_in_db}
 
-    # Detect vendor column for search + grouping later
+    # Detect vendor column (for header text in quote)
     vendor_col = None
     if src == 'restock':
         if 'vendors' in cols_lower:
@@ -470,7 +456,7 @@ else:
     # Date-only formatting
     df = strip_time(df, DATE_COLS.get(src, []))
 
-    # Exports (downloads) frame: preserve on-disk order, hide IDs/technical columns
+    # Exports (downloads): preserve on-disk order, hide IDs
     cols_in_order = table_columns_in_order(db_path, src)
     hide_set = set(HIDE_COLS.get(src, []))
     cols_for_download = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
@@ -495,12 +481,17 @@ else:
         if c != "Select":
             col_cfg[c] = st.column_config.Column(disabled=True)
 
+    grid_key = f"grid_{src}"
+    # If user presses "Clear selections", we will overwrite this state below
+    if grid_key not in st.session_state:
+        st.session_state[grid_key] = df_display.copy()
+
     edited = st.data_editor(
-        df_display,
+        st.session_state[grid_key],
         use_container_width=True,
         hide_index=True,
         column_config=col_cfg,
-        key=f"grid_{src}"
+        key=grid_key
     )
 
     # Recover selected rows using original index alignment
@@ -510,8 +501,8 @@ else:
         selected_idx = []
     selected_rows = df.loc[selected_idx] if len(selected_idx) else df.iloc[0:0]
 
-    # ---------- Standard downloads (whole result set) ----------
-    c1, c2, _ = st.columns([1, 1, 3])
+    # ---------- Downloads (whole result set) + Clear selections ----------
+    c1, c2, c3, _ = st.columns([1, 1, 1, 3])
     with c1:
         st.download_button(
             label='⬇️ Excel (.xlsx)',
@@ -526,69 +517,42 @@ else:
             file_name=f"{ds.replace(' ', '_')}.docx",
             mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
+    with c3:
+        if st.button("🧹 Clear selections"):
+            cleared = df_display.copy()
+            cleared["Select"] = False
+            st.session_state[grid_key] = cleared
+            st.rerun()
 
     # ---------- Quote Request generation (selected rows) ----------
     st.markdown("#### Quote Request (from selected rows)")
-
     if selected_rows.empty:
-        st.caption("Select rows using the checkboxes to enable quote downloads.")
+        st.caption("Select rows using the checkboxes to enable the quote download.")
     else:
-        # Group by Vendor if present; else single group "Unknown"
-        vcol = vendor_col if (vendor_col and vendor_col in selected_rows.columns) else None
-        if vcol:
-            vendor_groups = selected_rows.groupby(selected_rows[vcol].fillna("Unknown"))
-            vendor_list = [(str(v), g.copy()) for v, g in vendor_groups]
+        # Pick vendor header
+        if vendor_col and vendor_col in selected_rows.columns:
+            unique_vendors = sorted(set(selected_rows[vendor_col].dropna().astype(str)))
+            v_header = unique_vendors[0] if len(unique_vendors) == 1 else "Multiple"
         else:
-            vendor_list = [("Unknown", selected_rows.copy())]
+            v_header = "Unknown"
 
-        # ZIP: one Word per vendor
-        def build_zip_per_vendor() -> bytes:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for vname, gdf in vendor_list:
-                    doc_bytes = quote_docx_bytes(
-                        gdf, vendor=vname, title_companies=title_companies, dataset_label=ds
-                    )
-                    fname = f"Quote_{sanitize_filename(title_companies)}_{sanitize_filename(vname)}.docx"
-                    zf.writestr(fname, doc_bytes)
-            return buf.getvalue()
-
-        # Single combined Word (marks vendor as "Multiple" if many)
         def build_single_doc() -> bytes:
-            vend = vendor_list[0][0] if len(vendor_list) == 1 else "Multiple"
             return quote_docx_bytes(
-                selected_rows, vendor=vend, title_companies=title_companies, dataset_label=ds
+                selected_rows, vendor=v_header, title_companies=title_companies, dataset_label=ds
             )
 
-        c3, c4, _ = st.columns([1.8, 1.8, 2.4])
-        with c3:
-            st.download_button(
-                "🧾 Generate Quote per Vendor (ZIP)",
-                data=build_zip_per_vendor(),
-                file_name=f"Quotes_{ds.replace(' ','_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-            )
-        with c4:
-            if len(vendor_list) == 1:
-                vname, gdf = vendor_list[0]
-                st.download_button(
-                    f"🧾 Single Word — {vname}",
-                    data=quote_docx_bytes(gdf, vendor=vname, title_companies=title_companies, dataset_label=ds),
-                    file_name=f"Quote_{sanitize_filename(title_companies)}_{sanitize_filename(vname)}.docx",
-                    mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                )
-            else:
-                st.download_button(
-                    "🧾 Single Word — All Selected",
-                    data=build_single_doc(),
-                    file_name=f"Quote_All_Selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
-                    mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                )
+        st.download_button(
+            "🧾 Generate Quote (Word)",
+            data=build_single_doc(),
+            file_name=f"Quote_{sanitize_filename(title_companies)}_{datetime.now().strftime('%Y%m%d')}.docx",
+            mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        )
 
     # ---------- Config template (admins only) ----------
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
