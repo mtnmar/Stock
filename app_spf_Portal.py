@@ -338,7 +338,7 @@ else:
 
     db_path = resolve_db_path(cfg)
 
-    # Sidebar caption: only the "last updated" info
+    # Sidebar caption: only the "last updated" info (no DB path, no version)
     updated_label = get_data_last_updated(cfg, db_path)
     if updated_label:
         st.sidebar.caption(updated_label)
@@ -346,21 +346,24 @@ else:
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
 
-    # Dataset -> table name
+    # Dataset -> table name (radio)
     ds = st.sidebar.radio('Dataset', ['RE-STOCK', 'Outstanding POs'], index=0)
     src = 'restock' if ds == 'RE-STOCK' else 'po_outstanding'
 
-    # --- Authorization by Company ---
+    # --- Authorization by Company (case-insensitive username lookup + lenient company matching) ---
     all_companies_df = q(
         f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
         db_path=db_path
     )
     all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
 
+    # Case-insensitive username handling
     username_ci = str(username).casefold()
-    admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
+    admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
+    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
     is_admin = username_ci in admin_users_ci
 
+    # Case-insensitive lookup of user_companies
     uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
     uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
     allowed_cfg = uc_ci_map.get(username_ci, [])
@@ -369,17 +372,26 @@ else:
     allowed_cfg = [a for a in (allowed_cfg or [])]
 
     def norm(s: str) -> str:
+        # trim, collapse inner spaces, casefold for compare
         return " ".join(str(s).strip().split()).casefold()
 
-    db_map = {norm(c): c for c in all_companies}
+    # Build normalization map for DB company strings
+    db_map = {norm(c): c for c in all_companies}         # normalized -> DB original
     allowed_norm = {norm(a) for a in allowed_cfg}
     star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
 
     if is_admin or star_granted:
+        # Admins (or '*') see everything in the dataset
         allowed_set = set(all_companies)
     else:
+        # Prefer matches that actually exist in the dataset
         matches = {db_map[n] for n in allowed_norm if n in db_map}
-        allowed_set = matches if matches else set(allowed_cfg)
+        if matches:
+            allowed_set = matches
+        else:
+            # If none of the configured companies exist in this dataset now,
+            # still show the configured names; selection may yield 0 rows.
+            allowed_set = set(allowed_cfg)
 
     if not allowed_set:
         st.error("No companies configured for your account. Ask an admin to update your access.")
@@ -390,6 +402,7 @@ else:
     company_options = sorted(allowed_set)
     ADMIN_ALL = "« All companies (admin) »"
 
+    # Dropdown: required choice (no default). Admins get an "All" option.
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1:
         select_options += [ADMIN_ALL]
@@ -412,7 +425,7 @@ else:
     cols_in_db = table_columns_in_order(db_path, src)
     cols_lower = {c.lower(): c for c in cols_in_db}
 
-    # Detect vendor column (for header text in quote)
+    # Detect vendor column for search + grouping later
     vendor_col = None
     if src == 'restock':
         if 'vendors' in cols_lower:
@@ -456,7 +469,7 @@ else:
     # Date-only formatting
     df = strip_time(df, DATE_COLS.get(src, []))
 
-    # Exports (downloads): preserve on-disk order, hide IDs
+    # Preserve on-disk order but hide IDs/technical columns for downloads
     cols_in_order = table_columns_in_order(db_path, src)
     hide_set = set(HIDE_COLS.get(src, []))
     cols_for_download = [c for c in cols_in_order if (c in df.columns) and (c not in hide_set)]
@@ -465,63 +478,72 @@ else:
     # ---------- DISPLAY GRID (with checkboxes; hide Rsvd/Ord/Company only on-screen) ----------
     st.markdown(f"### {ds} — {title_companies}")
 
-    display_hide = {"Rsvd","Ord","Company"}
+    # Hide only on-screen
+    display_hide = {"Rsvd", "Ord", "Company"}
     display_cols = [c for c in cols_for_download if c not in display_hide]
+
+    # Base display DF for the grid (fresh each run)
     df_display = df[display_cols].copy()
 
-    # Insert Select column at left (default False)
+    # Insert Select column at the left (default False each render)
     if "Select" not in df_display.columns:
         df_display.insert(0, "Select", False)
 
-    # Build column config: only Select is editable
-    col_cfg = {"Select": st.column_config.CheckboxColumn(
-        "Add to Quote", help="Check to include this line in a quote request", default=False
-    )}
+    # Column config: only Select is editable
+    col_cfg = {
+        "Select": st.column_config.CheckboxColumn(
+            "Add to Quote",
+            help="Check to include this line in a quote request",
+            default=False,
+        )
+    }
     for c in df_display.columns:
         if c != "Select":
             col_cfg[c] = st.column_config.Column(disabled=True)
 
-    grid_key = f"grid_{src}"
-    # If user presses "Clear selections", we will overwrite this state below
-    if grid_key not in st.session_state:
-        st.session_state[grid_key] = df_display.copy()
+    # Versioned widget key so clear selections can reset the checkboxes
+    base_key = f"grid_{src}"
+    ver_key = f"{base_key}_ver"
+    if ver_key not in st.session_state:
+        st.session_state[ver_key] = 0
+    grid_key = f"{base_key}_{st.session_state[ver_key]}"
 
+    # Render the editor with the DataFrame itself
     edited = st.data_editor(
-        st.session_state[grid_key],
+        df_display,
         use_container_width=True,
         hide_index=True,
         column_config=col_cfg,
-        key=grid_key
+        key=grid_key,
     )
 
-    # Recover selected rows using original index alignment
+    # Figure out which rows were selected (keeps original index)
     try:
         selected_idx = edited.index[edited["Select"] == True]
     except Exception:
         selected_idx = []
     selected_rows = df.loc[selected_idx] if len(selected_idx) else df.iloc[0:0]
 
-    # ---------- Downloads (whole result set) + Clear selections ----------
+    # ---------- Standard downloads (whole result set) + Clear selections ----------
     c1, c2, c3, _ = st.columns([1, 1, 1, 3])
     with c1:
         st.download_button(
-            label='⬇️ Excel (.xlsx)',
-            data=to_xlsx_bytes(df_download, sheet=ds.replace(' ', '_')),
+            label="⬇️ Excel (.xlsx)",
+            data=to_xlsx_bytes(df_download, sheet=ds.replace(" ", "_")),
             file_name=f"{ds.replace(' ', '_')}.xlsx",
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
         st.download_button(
-            label='⬇️ Word (.docx)',
+            label="⬇️ Word (.docx)",
             data=to_docx_table_bytes(df_download, title=f"{ds} — {title_companies}"),
             file_name=f"{ds.replace(' ', '_')}.docx",
-            mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
     with c3:
+        # Clear selections: bump version so the widget key changes, wiping prior checkbox state
         if st.button("🧹 Clear selections"):
-            cleared = df_display.copy()
-            cleared["Select"] = False
-            st.session_state[grid_key] = cleared
+            st.session_state[ver_key] += 1
             st.rerun()
 
     # ---------- Quote Request generation (selected rows) ----------
@@ -529,7 +551,7 @@ else:
     if selected_rows.empty:
         st.caption("Select rows using the checkboxes to enable the quote download.")
     else:
-        # Pick vendor header
+        # Determine vendor header
         if vendor_col and vendor_col in selected_rows.columns:
             unique_vendors = sorted(set(selected_rows[vendor_col].dropna().astype(str)))
             v_header = unique_vendors[0] if len(unique_vendors) == 1 else "Multiple"
@@ -552,6 +574,7 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
 
 
