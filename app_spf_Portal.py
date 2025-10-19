@@ -1,9 +1,12 @@
 # app_spf_portal.py
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
-# - Ship-To contact pulled from user_data (Contact, Email, Phone) by Company (fallbacks to user_contacts)
-# - Restores Excel (.xlsx) download for RE-STOCK current view
-# - Quotes saved in same DB table 'quotes' (auto-created)
+# - Ship-To: Company (prefix removed in DOC only), Address, City/State/Zip, Contact, Email, Phone
+# - Contact pulled from User_Data (fallback user_data/user_contacts) by Company & Username
+# - Bill-To from addresses.Billing (+ Billing Contact/Email/Phone)
+# - Address table in DOC is borderless
+# - Generate -> saves to DB (quotes) and offers DOCX download
+# - RE-STOCK XLSX download restored
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -14,7 +17,7 @@
 #   python-docx>=1.1
 #   pyyaml>=6.0
 #   requests>=2.31
-#   pyarrow>=17.0   # or fastparquet>=2024.5.0
+#   pyarrow>=17.0
 
 from __future__ import annotations
 import os, io, re, json, sqlite3, textwrap, hashlib
@@ -26,7 +29,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.19-shipcontact-xlsx"
+APP_VERSION = "2025.10.19-fix-address-username"
 
 # ---- deps ----
 try:
@@ -37,7 +40,9 @@ except Exception:
 
 try:
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, Inches
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
 except Exception:
     st.error("python-docx not installed. Add to requirements.txt")
     st.stop()
@@ -340,7 +345,7 @@ def list_quotes(db_path: str, company: Optional[str]=None, include_all: bool=Fal
                 "FROM quotes ORDER BY id DESC", conn)
     return df
 
-# ---------- Addresses & contacts ----------
+# ---------- Tables & address helpers ----------
 @st.cache_data(show_spinner=False)
 def _load_table(db_path: str, name: str) -> pd.DataFrame:
     try:
@@ -350,12 +355,16 @@ def _load_table(db_path: str, name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def _pick_first_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    # exact match first
     for c in candidates:
         if c in df.columns: return c
+    # loose contains match
     lower = {c.lower(): c for c in df.columns}
     for want in candidates:
+        w = want.lower()
         for lc, orig in lower.items():
-            if want.lower() in lc: return orig
+            if w == lc or w in lc:
+                return orig
     return None
 
 def _join_nonempty(*parts: str, sep: str = " ") -> str:
@@ -365,10 +374,7 @@ def _join_nonempty(*parts: str, sep: str = " ") -> str:
 def _split_semicolon_lines(s: str) -> List[str]:
     s = str(s or "").strip()
     if not s: return []
-    if ";" in s:
-        pieces = [p.strip() for p in s.split(";") if p.strip()]
-        return pieces
-    return [s]
+    return [p.strip() for p in s.split(";") if p.strip()] if ";" in s else [s]
 
 def _first_nonempty(df: pd.DataFrame, col: str) -> Optional[str]:
     if col not in df.columns or df.empty: return None
@@ -376,100 +382,141 @@ def _first_nonempty(df: pd.DataFrame, col: str) -> Optional[str]:
     s = s[s != ""]
     return s.iloc[0] if not s.empty else None
 
-def _user_data_table(db_path: str) -> Tuple[pd.DataFrame, str]:
-    """Return (df, table_name) preferring 'user_data', fallback to 'user_contacts'."""
-    ud = _load_table(db_path, "user_data")
-    if not ud.empty: return ud, "user_data"
-    uc = _load_table(db_path, "user_contacts")
-    return uc, "user_contacts"
+def _user_table(db_path: str) -> Tuple[pd.DataFrame, str]:
+    """Prefer 'User_Data', then 'user_data', then 'user_contacts'."""
+    for name in ("User_Data", "user_data", "user_contacts"):
+        df = _load_table(db_path, name)
+        if not df.empty:
+            return df, name
+    return pd.DataFrame(), ""
+
+def _match_user_contact(df: pd.DataFrame, company: str, username: str) -> Tuple[str,str,str]:
+    """Return (Contact, Email, Phone) matched by Company and Username (case-insensitive)."""
+    if df.empty: return ("", "", "")
+    comp_col = _pick_first_col(df, ["Company","Location","Site","Name"]) or "Company"
+    user_col = _pick_first_col(df, ["Username","User","Login","Email","UserName"])
+    contact_col = _pick_first_col(df, ["Contact","Name"]) or "Contact"
+    email_col   = _pick_first_col(df, ["Email"]) or "Email"
+    phone_col   = _pick_first_col(df, ["Phone","Telephone","Cell"]) or "Phone"
+
+    view = df
+    if comp_col in df.columns:
+        view = view[view[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()] or df
+
+    if user_col and (user_col in df.columns) and not view.empty:
+        uv = view[view[user_col].astype(str).str.strip().str.casefold() == str(username).strip().casefold()]
+        if not uv.empty:
+            view = uv
+
+    if view.empty:
+        view = df
+
+    row = view.iloc[0]
+    return (
+        str(row.get(contact_col, "") or "").strip(),
+        str(row.get(email_col, "") or "").strip(),
+        str(row.get(phone_col, "") or "").strip(),
+    )
 
 def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[str, str]:
     """
     Ship To:
-      - address from 'addresses' row where Company == company
-      - contact from 'user_data' (or user_contacts) row for the same Company,
-        first matching username (case-insensitive) if present; else first for company;
-        fields: Contact, Email, Phone
+      Company (prefix removed in display)
+      Address
+      City, State Zip
+      Contact
+      Email
+      Phone: nnn
     Bill To:
-      - from 'addresses' first non-empty 'Billing' (semicolon-separated lines) +
-        optional Billing Contact / BillingPhone / BillingEmail lines
+      From addresses.Billing (semicolon -> lines) + optional Billing Contact/Email/Phone
     """
     adr = _load_table(db_path, "addresses")
-    user_df, _ = _user_data_table(db_path)
+    user_df, _ = _user_table(db_path)
 
-    # --- Bill To (Greer Industries, Inc... via addresses Billing fields) ---
+    # --- Bill To ---
     bill_lines: List[str] = []
-    billing_block = _first_nonempty(adr, "Billing")
-    if billing_block:
-        bill_lines.extend(_split_semicolon_lines(billing_block))
-    # Append optional contact/email/phone (from same addresses row if present)
-    # pick the first row that had Billing text
-    bill_row = adr[adr.get("Billing","").astype(str).str.strip() != ""].iloc[0] if ("Billing" in adr.columns and not adr.empty and any(adr["Billing"].astype(str).str.strip()!="")) else (adr.iloc[0] if not adr.empty else pd.Series(dtype="object"))
-    for lbl, cname in [("Contact","Billing Contact"), ("Phone","BillingPhone"), ("Email","BillingEmail")]:
-        if isinstance(bill_row, pd.Series) and cname in bill_row.index and str(bill_row[cname]).strip():
-            val = str(bill_row[cname]).strip()
-            if lbl == "Contact":
-                bill_lines.append(val)
-            elif lbl == "Phone":
-                bill_lines.append(f"Phone: {val}")
-            else:
-                bill_lines.append(val)
+    if not adr.empty and "Billing" in adr.columns:
+        # use first non-empty Billing
+        billing_text = _first_nonempty(adr, "Billing")
+        if billing_text:
+            bill_lines.extend(_split_semicolon_lines(billing_text))
+        # add optional contact/email/phone from the same first row with Billing
+        bill_row = adr[adr["Billing"].astype(str).str.strip() != ""].iloc[0] if any(adr["Billing"].astype(str).str.strip() != "") else adr.iloc[0]
+        if isinstance(bill_row, pd.Series):
+            b_contact = str(bill_row.get(_pick_first_col(adr, ["Billing Contact","BillingContact"]), "") or "").strip()
+            b_email   = str(bill_row.get(_pick_first_col(adr, ["BillingEmail","Billing Email"]), "") or "").strip()
+            b_phone   = str(bill_row.get(_pick_first_col(adr, ["BillingPhone","Billing Phone"]), "") or "").strip()
+            if b_contact: bill_lines.append(b_contact)
+            if b_email:   bill_lines.append(b_email)
+            if b_phone:   bill_lines.append(f"Phone: {b_phone}")
     bill_txt = "\n".join([ln for ln in bill_lines if ln])
 
-    # --- Ship To: address from addresses + contact from user_data ---
-    # Address row (match exact Company including numeric prefix)
+    # --- Ship To ---
     ship_lines: List[str] = []
+    # Address row matching the exact chosen company (with prefix)
     if not adr.empty:
         comp_col = _pick_first_col(adr, ["Company","Location","Site","Name"]) or "Company"
-        row = adr[adr[comp_col].astype(str) == str(company)]
-        arow = row.iloc[0] if not row.empty else (adr.iloc[0] if not adr.empty else pd.Series(dtype="object"))
-        # Add Company name (display without numeric prefix per doc requirement)
-        ship_lines.append(remove_prefix_for_display(str(company)))
+        sub = adr[adr[comp_col].astype(str) == str(company)]
+        arow = sub.iloc[0] if not sub.empty else (adr.iloc[0] if not adr.empty else pd.Series(dtype="object"))
+    else:
+        arow = pd.Series(dtype="object")
 
-        # Combined Address field preferred
-        if "Address" in arow.index and str(arow.get("Address","")).strip():
-            ship_lines.extend(_split_semicolon_lines(str(arow["Address"])))
-        else:
-            # Street 1/2 + City/State/Zip combos (best-effort)
-            for cands in (["Street","Address 1","Address1","Line1"], ["Address 2","Line2"]):
-                for c in cands:
-                    if c in arow.index and str(arow.get(c,"")).strip():
-                        ship_lines.append(str(arow[c]).strip())
-            city = arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")
-            state= arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")
-            zipc = arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code"]) or "", "")
-            cityline = _join_nonempty(str(city), _join_nonempty(str(state), str(zipc), sep=" "), sep=", " if (str(state).strip() or str(zipc).strip()) else " ")
-            if cityline.strip(): ship_lines.append(cityline)
+    # Line 1: Company (display WITHOUT prefix in the document)
+    ship_lines.append(remove_prefix_for_display(company))
 
-    # Contact from user_data/user_contacts
-    contact_name = contact_email = contact_phone = ""
-    if not user_df.empty:
-        # Try to match Company first
-        comp_col_ud = _pick_first_col(user_df, ["Company","Location","Site","Name"]) or "Company"
-        view = user_df[user_df[comp_col_ud].astype(str).str.strip().str.casefold() == str(company).strip().casefold()]
-        # Try to match username within that subset
-        user_cols = ["User","Username","UserName","Login","Email","Contact"]
-        user_col = _pick_first_col(user_df, user_cols)
-        if user_col and not view.empty:
-            row_user = view[view[user_col].astype(str).str.strip().str.casefold() == str(username).strip().casefold()]
-            if not row_user.empty:
-                view = row_user
-        if view.empty:
-            view = user_df  # fallback to any
+    # Line 2..: Address + City/State/Zip
+    # Use 'Address' (single field) if present; else Address1/Address2 + City/State/Zip
+    addr_field = None
+    for cand in ["Address","Address 1","Address1","Street","Line1"]:
+        if cand in arow.index and str(arow.get(cand,"")).strip():
+            addr_field = cand; break
+    if addr_field:
+        ship_lines.append(str(arow.get(addr_field, "")).strip())
+        # If there is a second address line, add it
+        for cand in ["Address 2","Address2","Line2","Street 2"]:
+            if cand in arow.index and str(arow.get(cand,"")).strip():
+                ship_lines.append(str(arow.get(cand,"")).strip())
+    else:
+        # nothing found; leave blank (still include city/state/zip below if present)
+        pass
 
-        rowc = view.iloc[0]
-        contact_name  = str(rowc.get(_pick_first_col(user_df, ["Contact","Name"]) or "", "")).strip()
-        contact_email = str(rowc.get(_pick_first_col(user_df, ["Email"]) or "", "")).strip()
-        contact_phone = str(rowc.get(_pick_first_col(user_df, ["Phone","Telephone"]) or "", "")).strip()
+    city  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")).strip()
+    state = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")).strip()
+    zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code"]) or "", "")).strip()
+    cityline = ""
+    if city and (state or zipc):
+        cityline = f"{city}, {_join_nonempty(state, zipc, sep=' ')}".strip(", ")
+    else:
+        cityline = _join_nonempty(city, state, zipc, sep=" ").strip()
+    if cityline:
+        ship_lines.append(cityline)
 
-    # Append contact lines (exact fields requested)
-    if contact_name:  ship_lines.append(contact_name)
-    if contact_email: ship_lines.append(contact_email)
-    if contact_phone: ship_lines.append(f"Phone: {contact_phone}")
+    # Contact from User_Data by Company & Username
+    c_name, c_email, c_phone = _match_user_contact(user_df, company, username)
+    if c_name:  ship_lines.append(c_name)
+    if c_email: ship_lines.append(c_email)
+    if c_phone: ship_lines.append(f"Phone: {c_phone}")
 
     ship_txt = "\n".join([ln for ln in ship_lines if ln])
 
     return ship_txt, bill_txt
+
+# ---------- Make address table borderless ----------
+def _table_no_borders(tbl) -> None:
+    tblPr = tbl._tbl.tblPr
+    # remove existing borders
+    for node in tblPr.findall(qn('w:tblBorders')):
+        tblPr.remove(node)
+    # add none borders
+    borders = OxmlElement('w:tblBorders')
+    for edge in ('top','left','bottom','right','insideH','insideV'):
+        el = OxmlElement(f'w:{edge}')
+        el.set(qn('w:val'), 'none')
+        el.set(qn('w:sz'), '0')
+        el.set(qn('w:space'), '0')
+        el.set(qn('w:color'), 'auto')
+        borders.append(el)
+    tblPr.append(borders)
 
 # ---------- Quote DOCX ----------
 def build_quote_docx(*, company: str, date_str: str, quote_number: str,
@@ -495,16 +542,22 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     vr = doc.add_paragraph(); vr.add_run("Vendor").bold = True
     doc.add_paragraph(vendor_text if vendor_text.strip() else "_____________________________")
 
-    # Addresses table (2 cols: Ship | Bill)
+    # Addresses table (2 cols: Ship | Bill) — borderless
     doc.add_paragraph("")
     tbl_addr = doc.add_table(rows=2, cols=2)
-    tbl_addr.style = 'Table Grid'
     hdr = tbl_addr.rows[0].cells
     hdr[0].text = "Ship To Address"
     hdr[1].text = "Bill To Address"
     cells = tbl_addr.rows[1].cells
     cells[0].text = ship_to_text
     cells[1].text = bill_to_text
+    _table_no_borders(tbl_addr)
+    # keep the table within page width (roughly half and half)
+    try:
+        for c in tbl_addr.columns[0].cells: c.width = Inches(3.25)
+        for c in tbl_addr.columns[1].cells: c.width = Inches(3.25)
+    except Exception:
+        pass
 
     # Lines table + trailing blanks (>= 30 rows total)
     doc.add_paragraph("")
@@ -516,6 +569,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
 
     tbl = doc.add_table(rows=1 + len(lines), cols=len(cols))
     tbl.style = 'Table Grid'
+    # widen PN/Description; other three are narrower
     for j,c in enumerate(cols): tbl.cell(0,j).text = c
     for i,(_,r) in enumerate(lines.iterrows(), start=1):
         for j,c in enumerate(cols): tbl.cell(i,j).text = str("" if pd.isna(r[c]) else r[c])
@@ -576,7 +630,7 @@ else:
     # Resolve DB path + expose in UI
     db_path = resolve_db_path(cfg)
     ACTIVE_DB_PATH = db_path
-    ensure_quotes_table(ACTIVE_DB_PATH)  # make sure 'quotes' exists now
+    ensure_quotes_table(ACTIVE_DB_PATH)  # ensure table exists
     pq_paths = detect_parquet_paths(cfg)
 
     # Sidebar info
@@ -748,7 +802,7 @@ else:
         if clear_sel_clicked:
             st.session_state[base_key] += 1; st.rerun()
 
-        # ✅ Restore XLSX download for current RE-STOCK view
+        # XLSX download for current RE-STOCK view
         excel_df = df_display.drop(columns=["Select"], errors="ignore").copy()
         excel_df.insert(0, "Inventory Check", "")
         c1, _, _ = st.columns([1, 1, 6])
@@ -848,11 +902,9 @@ else:
                     "Total":       ""
                 })
 
-                # Compose Ship/Bill blocks (Ship contact from user_data)
                 company_for_save = chosen if chosen != ADMIN_ALL else "All Companies"
                 ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username))
 
-                # Assign number & save
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote(
                     ACTIVE_DB_PATH,
@@ -867,7 +919,6 @@ else:
                 )
                 st.success(f"Saved Quote ID {qid} ({qnum})")
 
-                # Build doc and offer download (display company name without prefix inside doc)
                 doc_bytes = build_quote_docx(
                     company=company_for_save,
                     date_str=datetime.now().strftime("%Y-%m-%d"),
@@ -933,7 +984,7 @@ else:
         st.markdown(f"### Quotes — {title_companies}")
         ensure_quotes_table(ACTIVE_DB_PATH)
 
-        include_all = is_admin  # admins default to seeing all
+        include_all = is_admin
         if is_admin:
             include_all = st.toggle("Show all companies", value=True)
 
@@ -946,7 +997,6 @@ else:
 
             quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no, help="QR-YYYY-####")
             vendor = st.text_input("Vendor", value="")
-            # Prefill addresses (Ship uses user_data contact)
             ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, chosen if chosen != ADMIN_ALL else "All Companies", str(username))
             c1, c2 = st.columns(2)
             with c1:
@@ -1076,3 +1126,4 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
