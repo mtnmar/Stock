@@ -1,13 +1,16 @@
 # app_spf_portal.py
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
-# - RE-STOCK cart: Clear, Save, Generate (right) + small Remove (rightmost)
+# - Cart buttons: Remove (left, small) | Clear, Save, Generate, Email (right, small)
 # - Generate: saves quote to DB, then shows a download
-# - Quotes page (New / Browse-Edit), Generate also saves-then-downloads
-# - Bill To / Ship To from 'addresses' + 'user_contacts'
+# - Bill To / Ship To:
+#       * Ship To from 'addresses' + 'user_contacts'
+#       * Bill To from 'addresses' columns: Billing, BillingEmail, Billing Contact, BillingPhone
+#         (semicolon ';' in Billing -> line breaks)
 # - Quote # = QR-YYYY-#### with gap-filling (next available for year)
 # - Quotes stored in SAME DB (maintainx_po.db) table 'quotes'
-# - Company numeric prefix (e.g., "110 - ") is removed ONLY inside Word doc
+# - Company numeric prefix (e.g., "110 - ") is removed ONLY inside Word doc (header + 1st line of each address)
+# - Lines table column widths adjusted: PN/Desc wider; Qty/Price/Total narrower
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -30,7 +33,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.19-4"
+APP_VERSION = "2025.10.19-5"
 
 # ---- deps ----
 try:
@@ -41,7 +44,8 @@ except Exception:
 
 try:
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, Inches
+    from docx.oxml.ns import qn
 except Exception:
     st.error("python-docx not installed. Add to requirements.txt")
     st.stop()
@@ -432,18 +436,45 @@ def _contact_for_company(df: pd.DataFrame, company: str, role_pref: List[str]) -
 def build_ship_bill_blocks(db_path: str, company: str) -> Tuple[str, str]:
     adr = _load_table(db_path, "addresses")
     uc  = _load_table(db_path, "user_contacts")
-    bill_row = _row_for_company(adr, company=None)
-    bill_contact = _contact_for_company(uc, company=None, role_pref=["accounts payable","ap","billing"])
-    bill_txt = _compose_address_block(
-        company=str(bill_row.get(_pick_first_col(adr, ["Company","Name"]) ) or "Bill To").strip(),
-        arow=bill_row, contact=bill_contact
-    )
+
+    # Ship To: row matching selected company
     ship_row = _row_for_company(adr, company)
     ship_contact = _contact_for_company(uc, company, role_pref=["purchasing","buyer","stores","warehouse"])
-    ship_txt = _compose_address_block(
-        company=str(company),
-        arow=ship_row, contact=ship_contact
-    )
+    ship_txt = _compose_address_block(company=str(company), arow=ship_row, contact=ship_contact)
+
+    # Bill To: from dedicated Billing columns (same for all)
+    billing_col  = _pick_first_col(adr, ["Billing","Billing Address","BillingAddr","BillingAddress"])
+    b_email_col  = _pick_first_col(adr, ["BillingEmail","Billing Email","Billing_Email"])
+    b_contact_col= _pick_first_col(adr, ["Billing Contact","BillingContact","Billing Name","BillingName"])
+    b_phone_col  = _pick_first_col(adr, ["BillingPhone","Billing Phone","Billing_Tel","Billing Telephone"])
+
+    if adr.empty:
+        return ship_txt, ""
+
+    if billing_col:
+        base = adr[adr[billing_col].astype(str).str.strip() != ""]
+        brow = (base.iloc[0] if not base.empty else adr.iloc[0])
+    else:
+        brow = adr.iloc[0]
+
+    lines = [str(company).strip()]  # first line is company (prefix stripped later for DOCX only)
+    if billing_col and str(brow.get(billing_col,"")).strip():
+        lines.extend(_split_semicolon_lines(brow[billing_col]))
+
+    # Phone
+    if b_phone_col and str(brow.get(b_phone_col,"")).strip():
+        lines.append(f"Phone: {str(brow[b_phone_col]).strip()}")
+
+    # Contact + Email
+    contact_line = ""
+    if b_contact_col and str(brow.get(b_contact_col,"")).strip():
+        contact_line = str(brow[b_contact_col]).strip()
+    if contact_line:
+        lines.append(contact_line)
+    if b_email_col and str(brow.get(b_email_col,"")).strip():
+        lines.append(str(brow[b_email_col]).strip())
+
+    bill_txt = "\n".join([ln for ln in lines if ln])
     return ship_txt, bill_txt
 
 # ---------- ONLY-IN-DOCX cleaning (prefix "123 - " on company) ----------
@@ -456,6 +487,13 @@ def _clean_address_block_company_firstline(block: str) -> str:
         return ''
     lines[0] = _strip_company_prefix(lines[0])
     return "\n".join(lines)
+
+def _remove_table_borders(tbl) -> None:
+    # remove borders from a docx table
+    tblPr = tbl._tbl.tblPr
+    tblBorders = tblPr.tblBorders
+    if tblBorders is not None:
+        tblPr.remove(tblBorders)
 
 # ---------- Quote DOCX ----------
 def build_quote_docx(*, company: str, date_str: str, quote_number: str,
@@ -485,13 +523,14 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     vr = doc.add_paragraph(); vr.add_run("Vendor").bold = True
     doc.add_paragraph(vendor_text if vendor_text.strip() else "_____________________________")
 
-    # Addresses table (Ship | Bill)
+    # Addresses table (Ship | Bill) – no borders
     doc.add_paragraph("")
-    tbl_addr = doc.add_table(rows=2, cols=2); tbl_addr.style = 'Table Grid'
+    tbl_addr = doc.add_table(rows=2, cols=2)
     hdr = tbl_addr.rows[0].cells; hdr[0].text = "Ship To Address"; hdr[1].text = "Bill To Address"
     cells = tbl_addr.rows[1].cells; cells[0].text = ship_to_doc; cells[1].text = bill_to_doc
+    _remove_table_borders(tbl_addr)
 
-    # Lines table + trailing blanks
+    # Lines table + trailing blanks; set column widths
     doc.add_paragraph("")
     cols = ["Part Number","Description","Quantity","Price/Unit","Total"]
     lines = _coerce_lines_for_storage(lines_df).copy()
@@ -499,10 +538,18 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     if BLANK_ROWS > 0:
         lines = pd.concat([lines, pd.DataFrame([dict(zip(cols, [""]*5)) for _ in range(BLANK_ROWS)])], ignore_index=True)
 
-    tbl = doc.add_table(rows=1 + len(lines), cols=len(cols)); tbl.style = 'Table Grid'
+    tbl = doc.add_table(rows=1 + len(lines), cols=len(cols))
+    tbl.autofit = False
+    # header
     for j,c in enumerate(cols): tbl.cell(0,j).text = c
+    # body
     for i,(_,r) in enumerate(lines.iterrows(), start=1):
         for j,c in enumerate(cols): tbl.cell(i,j).text = str("" if pd.isna(r[c]) else r[c])
+    # widths: PN/Desc wider; Qty/Price/Total narrower
+    widths = [Inches(1.8), Inches(3.6), Inches(0.9), Inches(1.1), Inches(1.1)]
+    for j,w in enumerate(widths):
+        for i in range(len(lines)+1):
+            tbl.cell(i,j).width = w
 
     doc.add_paragraph("")
     qtot = doc.add_paragraph(); run3 = qtot.add_run("Quote Total"); run3.bold = True
@@ -562,7 +609,7 @@ else:
     ACTIVE_DB_PATH = db_path
     pq_paths = detect_parquet_paths(cfg)
 
-    # Sidebar info
+    # Sidebar info (helps confirm you're writing to the expected DB)
     st.sidebar.caption(label_for_source(
         "parquet" if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else "sqlite",
         str(pq_paths.get("restock") or pq_paths.get("po_outstanding")) if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else None
@@ -686,7 +733,7 @@ else:
 
         with st.form(f"{grid_key}_form", clear_on_submit=False):
             edited = st.data_editor(df_display, use_container_width=True, hide_index=True, column_config=grid_col_cfg, key=grid_key)
-            # smaller buttons: put inside narrow columns
+            # smaller "Add" / "Clear" buttons
             c_add, c_clear_sel, _pad = st.columns([0.9, 0.9, 8.2])
             add_clicked = c_add.form_submit_button("Add", use_container_width=True)
             clear_sel_clicked = c_clear_sel.form_submit_button("Clear", use_container_width=True)
@@ -776,12 +823,16 @@ else:
         with st.form(f"{cart_editor_key}_form", clear_on_submit=False):
             edited_cart = st.data_editor(cart_display, use_container_width=True, hide_index=True,
                                          column_config=cart_col_cfg, key=cart_editor_key)
-            # Buttons row: Clear, Save, Generate, (small) Remove on the right
-            c_clear, c_save, c_gen, c_rm = st.columns([1, 1, 1, 0.8])
-            clear_cart_btn = c_clear.form_submit_button("Clear", use_container_width=True, disabled=cart_df.empty)
-            save_qty = c_save.form_submit_button("Save", use_container_width=True)
-            gen_clicked = c_gen.form_submit_button("Generate", use_container_width=True)
-            remove_btn = c_rm.form_submit_button("Remove", use_container_width=True)
+            # Buttons row: Remove (left small) | Clear, Save, Generate, Email (right, small)
+            left, gap, right = st.columns([0.8, 6.2, 3.0])
+            with left:
+                remove_btn = st.form_submit_button("Remove", use_container_width=True)
+            with right:
+                c_clear, c_save, c_gen, c_email = st.columns([1, 1, 1, 1])
+                clear_cart_btn = c_clear.form_submit_button("Clear", use_container_width=True, disabled=cart_df.empty)
+                save_qty = c_save.form_submit_button("Save", use_container_width=True)
+                gen_clicked = c_gen.form_submit_button("Generate", use_container_width=True)
+                email_btn = c_email.form_submit_button("Email", use_container_width=True, disabled=True)
 
         if save_qty and "Qty" in edited_cart.columns:
             def norm_q(v):
@@ -819,10 +870,9 @@ else:
                         st.error("Cart has multiple vendors. Keep only one before generating.")
                         st.stop()
 
-                pncol = pn; desc = nm
                 lines_df = pd.DataFrame({
-                    "Part Number": st.session_state[cart_key][pncol].astype(str) if pncol else "",
-                    "Description": st.session_state[cart_key][desc].astype(str) if desc else "",
+                    "Part Number": st.session_state[cart_key][pn].astype(str) if pn else "",
+                    "Description": st.session_state[cart_key][nm].astype(str) if nm else "",
                     "Quantity":    st.session_state[cart_key]["__QTY__"].astype(str),
                     "Price/Unit":  "",
                     "Total":       ""
@@ -843,7 +893,7 @@ else:
                     source="restock",
                     lines_df=lines_df
                 )
-                st.success(f"Saved Quote ID {qid} ({qnum})")
+                st.success(f"Saved Quote ID {qid} ({qnum}) — DB now has {quotes_count(ACTIVE_DB_PATH)} quote(s).")
 
                 doc_bytes = build_quote_docx(
                     company=company_for_save,
@@ -955,7 +1005,7 @@ else:
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
                                            lines_df=edited_new)
-                    st.success(f"Saved quote #{qid} ({qnum})")
+                    st.success(f"Saved quote #{qid} ({qnum}) — DB now has {quotes_count(ACTIVE_DB_PATH)} quote(s).")
                     st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
             with c_gen:
                 if st.button("Generate", use_container_width=True):
@@ -965,7 +1015,7 @@ else:
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
                                            lines_df=edited_new)
-                    st.success(f"Saved quote #{qid} ({qnum})")
+                    st.success(f"Saved quote #{qid} ({qnum}) — DB now has {quotes_count(ACTIVE_DB_PATH)} quote(s).")
                     doc_bytes = build_quote_docx(
                         company=(chosen if chosen != ADMIN_ALL else "All Companies"),
                         date_str=datetime.now().strftime("%Y-%m-%d"),
@@ -1052,9 +1102,6 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
-
-
-
 
 
 
