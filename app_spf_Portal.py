@@ -1,8 +1,11 @@
 # app_spf_portal.py
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
-# (Keep numeric location prefixes everywhere except inside the Word
-# quote document where they are stripped for presentation.)
+# - Keep raw company labels (e.g., "110 - Deckers Creek Limestone") everywhere
+#   for filtering/storage; strip ONLY inside the generated Word document.
+# - RE-STOCK: cart (single vendor), editable Qty, Generate saves + downloads
+# - Outstanding POs: simple table (no cart)
+# - Quotes page: New (blank) & Browse/Edit; stored in same SQLite DB
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -25,7 +28,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.19-QUOTES-UX-RawCompanyEverywhere"
+APP_VERSION = "2025.10.19-DROPIN-RawCompanyEverywhere"
 
 # ---- deps ----
 try:
@@ -220,7 +223,7 @@ def ensure_quotes_table(db_path: str) -> None:
             CREATE TABLE IF NOT EXISTS quotes (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               quote_number TEXT UNIQUE,
-              company TEXT,           -- store RAW (with "110 - ...")
+              company TEXT,           -- RAW (with "110 - ...")
               created_by TEXT,
               vendor TEXT,
               ship_to TEXT,
@@ -362,15 +365,13 @@ def _split_semicolon_lines(s: str) -> List[str]:
         return pieces
     return [s]
 
-def _clean_company_label(s: str) -> str:
-    # For document-only: Remove leading "digits - " and trim
-    if s is None: return ""
-    return re.sub(r"^\s*\d+\s*-\s*", "", str(s)).strip()
+# DOC-ONLY cleaner: strip "digits - " prefix for presentation
+def _clean_company_label_for_doc(s: str) -> str:
+    return re.sub(r"^\s*\d+\s*-\s*", "", str(s or "")).strip()
 
 def _compose_address_block(company_for_doc: str, arow: pd.Series, contact: Optional[pd.Series]) -> str:
-    # Company (cleaned for the DOC), street/city, phone, "Name — Title", email
     lines: List[str] = []
-    comp = _clean_company_label(company_for_doc)
+    comp = _clean_company_label_for_doc(company_for_doc)  # DOC-ONLY cleaned
     if comp: lines.append(comp)
 
     comb_col = None
@@ -437,7 +438,7 @@ def _contact_for_company(df: pd.DataFrame, company_raw: str | None, role_pref: L
 def build_ship_bill_blocks(db_path: str, company_raw_exact: str) -> Tuple[str, str]:
     adr = _load_table(db_path, "addresses")
     uc  = _load_table(db_path, "user_contacts")
-    # Bill To: first row (or one marked billing if present)
+    # Bill To: first row (or a special row if you add a marker later)
     bill_row = _row_for_company(adr, company_raw=None)
     bill_contact = _contact_for_company(uc, company_raw=None, role_pref=["accounts payable","ap","billing"])
     bill_txt = _compose_address_block(
@@ -477,7 +478,7 @@ def build_quote_docx(*, company_raw_for_doc: str, date_str: str, quote_number: s
 
     # Header (Company — STRIPPED for DOC only)
     p = doc.add_paragraph()
-    run = p.add_run(_clean_company_label(company_raw_for_doc)); run.bold = True; run.font.size = Pt(14)
+    run = p.add_run(_clean_company_label_for_doc(company_raw_for_doc)); run.bold = True; run.font.size = Pt(14)
 
     title = doc.add_paragraph()
     run2 = title.add_run("Quote Request"); run2.bold = True; run2.font.size = Pt(16)
@@ -485,10 +486,10 @@ def build_quote_docx(*, company_raw_for_doc: str, date_str: str, quote_number: s
     doc.add_paragraph(date_str)
     doc.add_paragraph(f"Quote #: {quote_number}")
 
-    # Vendor line
+    # Vendor
     doc.add_paragraph("")
     vr = doc.add_paragraph(); vr.add_run("Vendor").bold = True
-    doc.add_paragraph(vendor_text if vendor_text.strip() else "_____________________________")
+    doc.add_paragraph(vendor_text if str(vendor_text).strip() else "_____________________________")
 
     # Addresses (no borders)
     doc.add_paragraph("")
@@ -572,7 +573,7 @@ else:
     auth.logout('Logout', 'sidebar')
     st.sidebar.success(f"Logged in as {name}")
 
-    # Resolve DB paths
+    # Resolve DB
     db_path = resolve_db_path(cfg)
     ACTIVE_DB_PATH = db_path
     pq_paths = detect_parquet_paths(cfg)
@@ -581,18 +582,18 @@ else:
         "parquet" if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else "sqlite",
         str(pq_paths.get("restock") or pq_paths.get("po_outstanding")) if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else None
     ))
-    st.sidebar.caption(f"DB used for quotes: `{Path(db_path).resolve()}`")
-    st.sidebar.caption(f"Quotes in DB: **{quotes_count(db_path)}**")
+    st.sidebar.caption(f"DB: `{Path(db_path).resolve()}`")
+    st.sidebar.caption(f"Quotes saved: **{quotes_count(db_path)}**")
     if st.sidebar.button("🔄 Refresh data"): st.cache_data.clear()
 
     page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0)
 
-    # Companies list (prefer addresses)
+    # Companies (RAW) — prefer addresses table
     def load_companies() -> List[str]:
         adr = _load_table(ACTIVE_DB_PATH, "addresses")
         comp_col = _pick_first_col(adr, ["Company","Location","Site","Name"])
         if not adr.empty and comp_col:
-            return sorted({str(x) for x in adr[comp_col].dropna().astype(str).tolist()})
+            return sorted({str(x) for x in adr[comp_col].dropna().astype(str)})
         try:
             df = q("SELECT DISTINCT [Company] FROM [restock] WHERE [Company] IS NOT NULL ORDER BY 1")
             return [str(x) for x in df["Company"].dropna().tolist()]
@@ -634,7 +635,7 @@ else:
     if is_admin and chosen == ADMIN_ALL:
         chosen_companies = sorted(all_companies); title_companies = "All companies (admin)"
     else:
-        chosen_companies = [chosen]; title_companies = chosen  # RAW (with prefix)
+        chosen_companies = [chosen]; title_companies = chosen  # RAW label (with prefix)
 
     # ----------------- RE-STOCK -----------------
     if page == "RE-STOCK":
@@ -682,7 +683,7 @@ else:
         hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__","__QTY__"}
         cols_for_download = [c for c in df.columns if (c not in hide_set)]
 
-        st.markdown(f"### RE-STOCK — {title_companies}")  # RAW company label
+        st.markdown(f"### RE-STOCK — {title_companies}")  # RAW label
         display_hide = {"Rsvd","Ord","Company","__KEY__","__QTY__"}
         display_cols = [c for c in cols_for_download if c not in display_hide]
         df_display = df[display_cols].copy()
@@ -751,7 +752,7 @@ else:
                                file_name="RE_STOCK.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # Cart controls: Remove | (right:) Clear, Save, Generate
+        # Cart controls: Remove (left) | right: Clear, Save, Generate
         cart_df: pd.DataFrame = st.session_state[cart_key]
         st.markdown(f"#### Cart ({len(cart_df)} item{'s' if len(cart_df)!=1 else ''})")
         if cart_df.empty:
@@ -818,7 +819,7 @@ else:
             st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns)+["__QTY__"])
             st.session_state[cart_base] += 1; st.rerun()
 
-        # Generate: save quote (RAW company), then download (cleaned only in DOC)
+        # Generate: save quote (RAW company), then download (cleaned in DOC only)
         if gen_clicked:
             if st.session_state[cart_key].empty:
                 st.warning("Cart is empty.")
@@ -855,7 +856,7 @@ else:
                 st.success(f"Saved Quote ID {qid} ({qnum})")
 
                 doc_bytes = build_quote_docx(
-                    company_raw_for_doc=str(company_raw_exact),   # Cleaned inside doc only
+                    company_raw_for_doc=str(company_raw_exact),   # cleaned inside doc only
                     date_str=datetime.now().strftime("%Y-%m-%d"),
                     quote_number=qnum,
                     vendor_text=vendor_text,
@@ -924,12 +925,11 @@ else:
 
         # --- NEW QUOTE ---
         with tab_new:
-            # Locations from addresses (RAW list with prefixes)
             adr = _load_table(ACTIVE_DB_PATH, "addresses")
             comp_col = _pick_first_col(adr, ["Company","Location","Site","Name"])
             if not adr.empty and comp_col:
                 raw_locations = sorted({str(x) for x in adr[comp_col].dropna().astype(str)})
-                sel_location_raw = st.selectbox("Location", options=raw_locations, index=0)
+                sel_location_raw = st.selectbox("Location", options=raw_locations, index=0)  # RAW label
             else:
                 st.warning("No addresses found; using current sidebar company.")
                 sel_location_raw = chosen
@@ -1013,7 +1013,6 @@ else:
 
         # --- BROWSE / EDIT ---
         with tab_browse:
-            include_all = st.toggle("Include all companies", value=True)
             dfq_all = list_quotes(ACTIVE_DB_PATH, company=None, include_all=True)
             if not dfq_all.empty:
                 comp_opts = ["All"] + sorted(set(dfq_all["company"].astype(str)))  # RAW in filter list
@@ -1070,7 +1069,7 @@ else:
                                                      company=str(rec["company"] or ""),  # keep RAW
                                                      created_by=str(username),
                                                      vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
-                                                     lines_df=edited_exist, quote_id=int(rec["id"]))
+                                                     lines_df=edited_exist, quote_id=int(rec['id']))
                             st.success(f"Saved quote #{qid2} ({qnum2})")
                             doc_bytes = build_quote_docx(
                                 company_raw_for_doc=str(rec["company"] or ""),  # cleaned inside DOC only
