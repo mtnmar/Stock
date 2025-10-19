@@ -4,7 +4,7 @@
 # - Login (streamlit-authenticator)
 # - Authorize & filter by Company (not Location)
 # - Uses raw tables: restock, po_outstanding (+ optional: addresses, user_contacts)
-# - NEW: quotes table (created on the fly in the same DB) for saving/editing requests
+# - NEW: quotes table (auto-created in SAME DB) for saving/editing requests
 # - Preserves exact column order (DB/Parquet) in grid & downloads
 # - Dates shown as YYYY-MM-DD (no time)
 # - Hides ID columns from grid & downloads
@@ -29,7 +29,7 @@
 #   pyarrow>=17.0   # or fastparquet>=2024.5.0
 
 from __future__ import annotations
-import os, io, re, json, sqlite3, textwrap, hashlib, uuid
+import os, io, re, json, sqlite3, textwrap, hashlib
 from pathlib import Path
 from collections.abc import Mapping, Iterable
 from typing import Optional, List, Tuple, Dict
@@ -59,6 +59,9 @@ st.set_page_config(page_title="SPF PO Portal", page_icon="📦", layout="wide")
 # ---------- Defaults & config ----------
 DEFAULT_DB = "maintainx_po.db"   # local fallback; Cloud may use secrets→GitHub
 HERE = Path(__file__).resolve().parent
+
+# NEW: active DB path used by q()/PRAGMA if caller forgets to pass db_path
+ACTIVE_DB_PATH: str | None = None
 
 CONFIG_TEMPLATE_YAML = """
 credentials:
@@ -202,7 +205,8 @@ def q_cached(sql: str, params: Tuple, db_path: str, db_sig: int) -> pd.DataFrame
         return pd.read_sql_query(sql, conn, params=params)
 
 def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
-    path = db_path or DEFAULT_DB
+    # Use explicit db_path if provided; else ACTIVE_DB_PATH; else DEFAULT_DB
+    path = db_path or ACTIVE_DB_PATH or DEFAULT_DB
     return q_cached(sql, tuple(params), path, _db_sig(path))
 
 @st.cache_data(show_spinner=False)
@@ -211,8 +215,9 @@ def table_columns_in_order_cached(db_path: str, table: str, db_sig: int) -> list
         rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
     return [r[1] for r in rows]
 
-def table_columns_in_order(db_path: str, table: str) -> list[str]:
-    return table_columns_in_order_cached(db_path, table, _db_sig(db_path))
+def table_columns_in_order(db_path: str | None, table: str) -> list[str]:
+    path = db_path or ACTIVE_DB_PATH or DEFAULT_DB
+    return table_columns_in_order_cached(path, table, _db_sig(path))
 
 # ---- Row key helper (shared) ----
 KEY_COL_CANDIDATES = ["ID", "id", "Purchase Order ID", "Row ID", "RowID"]
@@ -407,7 +412,7 @@ def save_quote(db_path: str, *, company: str, created_by: str, vendor: str, ship
         if col not in lines.columns:
             lines[col] = ""
     lines = lines[keep]
-    # drop trailing completely empty rows
+    # drop rows that are completely empty
     mask = (lines[keep].astype(str).apply(lambda r: "".join(r), axis=1).str.strip() != "")
     lines = lines[mask]
 
@@ -479,7 +484,10 @@ else:
     auth.logout('Logout', 'sidebar')
     st.sidebar.success(f"Logged in as {name}")
 
+    # Resolve DB path and set ACTIVE_DB_PATH so q()/PRAGMA always hit the right file
     db_path = resolve_db_path(cfg)
+    ACTIVE_DB_PATH = db_path  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< IMPORTANT
+
     pq_paths = detect_parquet_paths(cfg)
     st.sidebar.caption(label_for_source(
         "parquet" if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else "sqlite",
@@ -491,7 +499,7 @@ else:
     # Page selector (now 3 pages)
     page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0)
 
-    # --- preload some shared info for auth scoping ---
+    # --- shared loaders ---
     def load_src(src: str):
         pq_path = parquet_available_for(src, pq_paths)
         if pq_path:
@@ -501,14 +509,12 @@ else:
             all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
             return df_all, cols_in_db, all_companies, pq_path
         else:
-            all_companies_df = q(
-                f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1",
-            )
+            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1")
             all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
-            cols_in_db = table_columns_in_order(db_path, src)
+            cols_in_db = table_columns_in_order(None, src)
             return None, cols_in_db, all_companies, None
 
-    # We’ll base company scoping off RE-STOCK table (it always exists)
+    # Use RE-STOCK to build the company scope list
     _, cols_any, all_companies, _ = load_src("restock")
 
     username_ci = str(username).casefold()
@@ -617,7 +623,7 @@ else:
         if base_key not in st.session_state: st.session_state[base_key] = 0
         grid_key = f"{base_key}_{st.session_state[base_key]}"
 
-        # Data editor in a form (prevents re-run on every keystroke)
+        # Data editor in a form (prevents re-run on every click)
         with st.form(f"{grid_key}_form", clear_on_submit=False):
             edited = st.data_editor(
                 df_display,
@@ -792,7 +798,7 @@ else:
             st.session_state[cart_base] += 1
             st.rerun()
 
-        # Save to Quotes DB (from cart) — optional convenience
+        # Save this cart as a Quote (optional)
         if not st.session_state[cart_key].empty:
             with st.expander("Save this cart as a Quote (optional)"):
                 vendor_text = v_header if v_header != "Unknown" else ""
@@ -803,7 +809,6 @@ else:
                 with c2:
                     ship_to = st.text_area("Ship To (optional)", value=ship_to, height=80)
                 if st.button("Save as Quote"):
-                    # create simple 3-col df (Part Number/Name/Qty) for storage
                     pncol = pick_first_col(st.session_state[cart_key], ["Part Number","Part Numbers","Part #","Part","Part No","PN"])
                     nmcol = pick_first_col(st.session_state[cart_key], ["Name","Line Name","Description","Part Name","Item Name"])
                     store = pd.DataFrame({
@@ -811,7 +816,7 @@ else:
                         "Part Name":   st.session_state[cart_key][nmcol].astype(str) if nmcol else "",
                         "Qty":         qty_series_for_lines(st.session_state[cart_key])
                     })
-                    qid = save_quote(db_path, company=title_companies, created_by=str(username),
+                    qid = save_quote(ACTIVE_DB_PATH, company=title_companies, created_by=str(username),
                                      vendor=vendor_text, ship_to=ship_to, source="restock", lines_df=store)
                     st.success(f"Saved as quote #{qid}")
 
@@ -851,7 +856,7 @@ else:
         df = strip_time(df, DATE_COLS.get(src, []))
         df = attach_row_key(df)
         hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__", "__QTY__"}
-        cols_for_download = [c for c in table_columns_in_order(db_path, src) if (c in df.columns) and (c not in hide_set)]
+        cols_for_download = [c for c in table_columns_in_order(None, src) if (c in df.columns) and (c not in hide_set)]
         display_cols = [c for c in cols_for_download if c not in {"Company"}]
         st.markdown(f"### Outstanding POs — {title_companies}")
         st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
@@ -868,20 +873,20 @@ else:
                 "⬇️ Word (.docx)",
                 data=to_docx_table_bytes(df[cols_for_download], title=f"Outstanding POs — {title_companies}"),
                 file_name="Outstanding_POs.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             )
 
     # ========== PAGE: QUOTES ==========
     else:
         st.markdown(f"### Quotes — {title_companies}")
-        ensure_quotes_table(db_path)
+        ensure_quotes_table(ACTIVE_DB_PATH)
 
         tab_new, tab_browse = st.tabs(["🆕 New Quote", "📁 Browse / Edit"])
 
         # --- New Quote (manual, not from restock) ---
         with tab_new:
             st.caption("Create a new blank quote (not from the RE-STOCK report).")
-            vendor = st.text_input("Vendor (choose vendor — non-functional selector to be added later)", value="")
+            vendor = st.text_input("Vendor (placeholder — picker to be added later)", value="")
             ship_to = st.text_area("Ship To (optional — can auto-fill from Addresses later)", height=80, value="")
             # Blank 15 rows table
             rows = [{"Part Number":"", "Part Name":"", "Qty":""} for _ in range(15)]
@@ -901,7 +906,7 @@ else:
             c_left, c_sp, c_save, c_gen, c_email = st.columns([4, 5, 1, 1, 1])
             with c_save:
                 if st.button("Save", use_container_width=True):
-                    qid = save_quote(db_path, company=title_companies, created_by=str(username),
+                    qid = save_quote(ACTIVE_DB_PATH, company=title_companies, created_by=str(username),
                                      vendor=vendor, ship_to=ship_to, source="manual",
                                      lines_df=edited_new)
                     st.success(f"Saved as quote #{qid}")
@@ -918,14 +923,16 @@ else:
 
         # --- Browse / Edit ---
         with tab_browse:
-            dfq = list_quotes(db_path, company=title_companies if chosen != ADMIN_ALL else None)
+            dfq = list_quotes(ACTIVE_DB_PATH, company=title_companies if chosen != ADMIN_ALL else None)
             if dfq.empty:
                 st.info("No saved quotes yet.")
             else:
                 st.dataframe(dfq, hide_index=True, use_container_width=True)
-                qid = st.number_input("Quote ID to open", min_value=int(dfq["id"].min()),
-                                      max_value=int(dfq["id"].max()), value=int(dfq["id"].max()), step=1)
-                rec = load_quote(db_path, int(qid))
+                qid = st.number_input("Quote ID to open",
+                                      min_value=int(dfq["id"].min()),
+                                      max_value=int(dfq["id"].max()),
+                                      value=int(dfq["id"].max()), step=1)
+                rec = load_quote(ACTIVE_DB_PATH, int(qid))
                 if not rec:
                     st.warning("Quote not found.")
                 else:
@@ -944,7 +951,7 @@ else:
                     c_left, c_sp, c_save, c_gen, c_email = st.columns([4, 5, 1, 1, 1])
                     with c_save:
                         if st.button("Save", key=f"save_quote_{rec['id']}", use_container_width=True):
-                            save_quote(db_path, company=title_companies, created_by=str(username),
+                            save_quote(ACTIVE_DB_PATH, company=title_companies, created_by=str(username),
                                        vendor=rec["vendor"], ship_to=rec["ship_to"], source=rec["source"],
                                        lines_df=edited_exist, quote_id=int(rec["id"]))
                             st.success("Saved")
