@@ -1,18 +1,14 @@
 # app_spf_portal.py
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
-# - Remove prefix (e.g., "110 -") ONLY in the quote DOCX (title + Ship-To 1st line)
-# - Bill To from addresses: Billing, BillingPhone, Billing Contact, BillingEmail
-# - Ship To from addresses + user_contacts for LOGGED-IN USER (contact/phone/email)
-# - Addresses side-by-side in a borderless table
-# - RE-STOCK cart buttons (small):  Remove (left) | Clear • Save • Generate • Email (right)
-# - Generate saves to DB then offers DOCX download
+# - Ship-To contact/phone/email pulled from DB (user_contacts)
+# - Bill-To from addresses: Billing, BillingPhone, Billing Contact, BillingEmail
+# - Remove "### - " prefix from company ONLY inside the quote DOCX
+# - Borderless 2-col address table
+# - Line-items table widths fit page (6.5")
+# - Cart buttons (small): Remove (left) | Clear • Save • Generate • Email (right)
+# - Generate: save to DB then show download
 # - Quotes page: New & Browse/Edit + Filter by Company
-#
-# requirements:
-#   streamlit>=1.37, streamlit-authenticator==0.2.3, pandas>=2.0,
-#   openpyxl>=3.1, xlsxwriter>=3.2, python-docx>=1.1, pyyaml>=6.0,
-#   requests>=2.31, pyarrow>=17.0  (or fastparquet>=2024.5.0)
 
 from __future__ import annotations
 import os, io, re, json, sqlite3, textwrap, hashlib
@@ -25,7 +21,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.19-DRP2"
+APP_VERSION = "2025.10.19-DRP3"
 
 # deps
 try:
@@ -335,7 +331,6 @@ def _split_semicolon_lines(s: str) -> List[str]:
     return [p.strip() for p in s.split(";") if p.strip()] if ";" in s else [s]
 
 def _collapse_city_repeats(text: str) -> str:
-    """Collapse repeated 'City, ST 12345' phrases and repeated comma-separated duplicates."""
     if not text: return text
     pat = re.compile(r'(\b[A-Za-z .]+,\s*[A-Za-z]{2}\s*\d{5}(?:-\d{4})?\b)(?:\s*,?\s*\1\b)+')
     text = pat.sub(r'\1', text)
@@ -366,13 +361,27 @@ def _load_table(db_path: str, name: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def build_ship_bill_blocks(db_path: str, company: str,
-                           user_email: Optional[str],
-                           user_display_name: Optional[str]) -> Tuple[str, str]:
+def _choose_contact_for_company(uc: pd.DataFrame, company: str) -> Optional[pd.Series]:
+    """Prefer purchasing/buyer/stores/warehouse; else any row for company; else None."""
+    if uc.empty: return None
+    comp_col = _pick_first_col(uc, ["Company","Location","Site","Name"])
+    role_col = _pick_first_col(uc, ["Title","Role","Department"])
+    view = uc
+    if comp_col:
+        m = uc[comp_col].astype(str) == str(company)
+        if m.any(): view = uc[m]
+    if role_col and not view.empty:
+        role = view[role_col].astype(str).str.lower()
+        for kw in ["purchasing","buyer","stores","warehouse"]:
+            sub = view[role.str.contains(kw, na=False)]
+            if not sub.empty: return sub.iloc[0]
+    return view.iloc[0] if not view.empty else None
+
+def build_ship_bill_blocks(db_path: str, company: str) -> Tuple[str, str]:
     """
-    Returns (ship_to_text, bill_to_text) with deduped lines.
+    Returns (ship_to_text, bill_to_text).
     Bill To: 'Greer Industries, Inc' + Billing fields.
-    Ship To: address for selected company + user contact from user_contacts.
+    Ship To: address for selected company + contact/phone/email from user_contacts (same company).
     """
     adr = _load_table(db_path, "addresses")
     uc  = _load_table(db_path, "user_contacts")
@@ -388,7 +397,6 @@ def build_ship_bill_blocks(db_path: str, company: str,
         if bill_col:
             row = row[row[bill_col].astype(str).str.strip() != ""]
         row = (row if not row.empty else adr).iloc[0]
-
         if bill_col and str(row.get(bill_col, "")).strip():
             for piece in _split_semicolon_lines(str(row[bill_col])):
                 bill_lines.append(piece)
@@ -398,7 +406,6 @@ def build_ship_bill_blocks(db_path: str, company: str,
             bill_lines.append(str(row[contact_col]).strip())
         if email_col and str(row.get(email_col, "")).strip():
             bill_lines.append(str(row[email_col]).strip())
-
     bill_to_text = "\n".join(_dedup_lines(bill_lines))
 
     # --- Ship To ---
@@ -412,9 +419,8 @@ def build_ship_bill_blocks(db_path: str, company: str,
             m = adr[comp_col].astype(str) == str(company)
             if m.any(): view = adr[m]
         row = view.iloc[0]
-        # First line: company name without numeric prefix
+        # first line (company) with prefix removed in DOCX
         ship_lines.append(strip_company_prefix_for_doc(row.get(comp_col, company) if comp_col else company))
-
         # Address fields
         addr1 = _pick_first_col(adr, ["Address", "Addr", "Address1", "Line1"])
         addr2 = _pick_first_col(adr, ["Address2", "Line2"])
@@ -423,8 +429,7 @@ def build_ship_bill_blocks(db_path: str, company: str,
                 ship_lines.append(piece)
         if addr2 and str(row.get(addr2, "")).strip():
             ship_lines.append(str(row[addr2]).strip())
-
-        # City, State, Zip (append only if not already in previous lines)
+        # City, State, Zip
         city_col  = _pick_first_col(adr, ["City"])
         state_col = _pick_first_col(adr, ["State", "Sate", "ST"])
         zip_col   = _pick_first_col(adr, ["Zip", "ZIP", "Postal", "Postal Code"])
@@ -435,62 +440,39 @@ def build_ship_bill_blocks(db_path: str, company: str,
         if cityline:
             key_city = re.sub(r'[^a-z0-9]+', '', cityline.lower())
             have = any(re.sub(r'[^a-z0-9]+', '', ln.lower()) == key_city for ln in ship_lines)
-            if not have:
-                ship_lines.append(cityline)
+            if not have: ship_lines.append(cityline)
 
-    # Contact/phone/email from the logged-in user (user_contacts)
-    contact_line = None
-    phone_line   = None
-    email_line   = None
-    if not uc.empty:
-        email_col = _pick_first_col(uc, ["Email", "Mail"])
-        name_col  = _pick_first_col(uc, ["Name", "Contact", "Contact Name"])
-        role_col  = _pick_first_col(uc, ["Title", "Role", "Department"])
-        phone_col = _pick_first_col(uc, ["Phone", "Telephone", "Tel"])
-        comp_uc   = _pick_first_col(uc, ["Company", "Location", "Site", "Name"])
-        rowu = None
-        if user_email and email_col:
-            mm = uc[email_col].astype(str).str.strip().str.casefold() == str(user_email).strip().casefold()
-            if mm.any(): rowu = uc[mm].iloc[0]
-        if rowu is None and comp_uc:
-            mm2 = uc[comp_uc].astype(str) == str(company)
-            if mm2.any(): rowu = uc[mm2].iloc[0]
-        if rowu is not None:
-            disp_name = str(rowu.get(name_col, "") or user_display_name or "").strip()
-            role      = str(rowu.get(role_col, "")).strip()
-            if disp_name or role:
-                contact_line = " — ".join([p for p in [disp_name, role] if p])
-            pv = str(rowu.get(phone_col, "")).strip() if phone_col else ""
-            if pv: phone_line = f"Phone: {_strip_phone_label(pv)}"
-            ev = str(rowu.get(email_col, "")).strip() if email_col else ""
-            if ev: email_line = ev
-
-    if contact_line is None and user_display_name:
-        contact_line = user_display_name
-
-    for extra in [contact_line, phone_line, email_line]:
-        if extra and extra.strip():
-            ship_lines.append(extra)
+    # Contact/phone/email from user_contacts (same company)
+    rowu = _choose_contact_for_company(uc, company)
+    if rowu is not None and not rowu.empty:
+        name_col  = _pick_first_col(uc, ["Name","Contact","Contact Name"])
+        role_col  = _pick_first_col(uc, ["Title","Role","Department"])
+        phone_col = _pick_first_col(uc, ["Phone","Telephone","Tel"])
+        email_col = _pick_first_col(uc, ["Email","Mail"])
+        cname = str(rowu.get(name_col, "")).strip() if name_col else ""
+        crole = str(rowu.get(role_col, "")).strip() if role_col else ""
+        if cname or crole:
+            ship_lines.append(" — ".join([p for p in [cname, crole] if p]))
+        pv = str(rowu.get(phone_col, "")).strip() if phone_col else ""
+        if pv: ship_lines.append(f"Phone: {_strip_phone_label(pv)}")
+        ev = str(rowu.get(email_col, "")).strip() if email_col else ""
+        if ev: ship_lines.append(ev)
 
     ship_to_text = "\n".join(_dedup_lines(ship_lines))
     return ship_to_text, bill_to_text
 
 def _remove_table_borders(table) -> None:
-    """Remove all borders from a python-docx table safely."""
     tbl = table._tbl
     tblPr = tbl.tblPr
     if tblPr is None:
-        tblPr = OxmlElement('w:tblPr')
-        tbl._element.insert(0, tblPr)
+        tblPr = OxmlElement('w:tblPr'); tbl._element.insert(0, tblPr)
     borders = tblPr.find(qn('w:tblBorders'))
     if borders is None:
-        borders = OxmlElement('w:tblBorders')
-        tblPr.append(borders)
+        borders = OxmlElement('w:tblBorders'); tblPr.append(borders)
     for edge in ('top','left','bottom','right','insideH','insideV'):
         el = borders.find(qn(f'w:{edge}'))
         if el is None:
-            el = OxmlElement(f'w:{edge}')
-            borders.append(el)
+            el = OxmlElement(f'w:{edge}'); borders.append(el)
         el.set(qn('w:val'), 'nil')
 
 def build_quote_docx(*, company: str, date_str: str, quote_number: str,
@@ -500,7 +482,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(10)
 
-    # Company (prefix removed only in document)
+    # Company (prefix removed only in DOCX)
     p = doc.add_paragraph()
     run = p.add_run(strip_company_prefix_for_doc(company)); run.bold = True; run.font.size = Pt(14)
 
@@ -515,11 +497,10 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     r2 = doc.add_paragraph().add_run("Vendor"); r2.bold = True
     doc.add_paragraph(vendor_text if str(vendor_text).strip() else "_____________________________")
 
-    # Address table (2 cols, no borders)
+    # Addresses
     doc.add_paragraph("")
     tbl_addr = doc.add_table(rows=2, cols=2)
     tbl_addr.style = "Table Grid"
-    tbl_addr.autofit = True
     hdr = tbl_addr.rows[0].cells
     hdr[0].text = "Ship To Address"
     hdr[1].text = "Bill To Address"
@@ -528,7 +509,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     cells[1].text = bill_to_text
     _remove_table_borders(tbl_addr)
 
-    # Lines table
+    # Lines table (fits 6.5")
     doc.add_paragraph("")
     cols = ["Part Number", "Description", "Quantity", "Price/Unit", "Total"]
     lines = lines_df.copy()
@@ -546,11 +527,11 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     for i, (_, rrow) in enumerate(lines.iterrows(), start=1):
         for j, c in enumerate(cols): tbl.cell(i, j).text = str(rrow[c])
 
-    # tuned widths: PN/Desc wider; Qty/Price/Total smaller
-    widths = [Inches(2.0), Inches(4.0), Inches(1.0), Inches(1.2), Inches(1.2)]
-    for row in tbl.rows:
-        for j, w in enumerate(widths):
-            row.cells[j].width = w
+    # exact column widths sum to 6.5"
+    widths = [Inches(1.0), Inches(3.8), Inches(0.6), Inches(0.55), Inches(0.55)]
+    for col_idx, w in enumerate(widths):
+        for row in tbl.rows:
+            row.cells[col_idx].width = w
 
     doc.add_paragraph("")
     rr = doc.add_paragraph().add_run("Quote Total"); rr.bold = True
@@ -731,7 +712,6 @@ else:
         if base_key not in st.session_state: st.session_state[base_key] = 0
         grid_key = f"{base_key}_{st.session_state[base_key]}"
 
-        # grid form (small buttons): Add selected (left) | Clear (right)
         with st.form(f"{grid_key}_form", clear_on_submit=False):
             edited = st.data_editor(df_display, use_container_width=True, hide_index=True, column_config=grid_col_cfg, key=grid_key)
             b_add, b_sp, b_clear = st.columns([1, 6, 1])
@@ -812,7 +792,6 @@ else:
         with st.form(f"{cart_editor_key}_form", clear_on_submit=False):
             edited_cart = st.data_editor(cart_display, use_container_width=True, hide_index=True,
                                          column_config=cart_col_cfg, key=cart_editor_key)
-            # small buttons: Remove (left) | Clear • Save • Generate • Email (right)
             c_rm, spacer, c_clear, c_save, c_gen, c_email = st.columns([1, 5, 1, 1, 1, 1])
             remove_btn     = c_rm   .form_submit_button("🗑️ Remove",   use_container_width=True)
             clear_cart_btn = c_clear.form_submit_button("🧼 Clear",    use_container_width=True, disabled=cart_df.empty)
@@ -856,23 +835,16 @@ else:
                         st.error("Cart has multiple vendors. Keep only one before generating.")
                         st.stop()
 
-                pncol = pn; desc = nm
                 lines_df = pd.DataFrame({
-                    "Part Number": st.session_state[cart_key][pncol].astype(str) if pncol else "",
-                    "Description": st.session_state[cart_key][desc].astype(str) if desc else "",
+                    "Part Number": st.session_state[cart_key][pn].astype(str) if pn else "",
+                    "Description": st.session_state[cart_key][nm].astype(str) if nm else "",
                     "Quantity":    st.session_state[cart_key]["__QTY__"].astype(str),
                     "Price/Unit":  "",
                     "Total":       ""
                 })
 
                 company_for_save = chosen if chosen != ADMIN_ALL else "All Companies"
-                user_email_cfg = (cfg.get('credentials', {})
-                                    .get('usernames', {})
-                                    .get(username, {})
-                                    .get('email'))
-                ship_to_txt, bill_to_txt = build_ship_bill_blocks(
-                    ACTIVE_DB_PATH, company_for_save, user_email_cfg, name
-                )
+                ship_to_txt, bill_to_txt = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save)
 
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote(
@@ -959,9 +931,7 @@ else:
             vendor = st.text_input("Vendor", value="")
             ship_to, bill_to = build_ship_bill_blocks(
                 ACTIVE_DB_PATH,
-                chosen if chosen != ADMIN_ALL else "All Companies",
-                (cfg.get('credentials', {}).get('usernames', {}).get(username, {}) or {}).get('email'),
-                name
+                chosen if chosen != ADMIN_ALL else "All Companies"
             )
             c1, c2 = st.columns(2)
             with c1:
