@@ -6,6 +6,7 @@
 # ✅ Generate always inserts a NEW quote (no overwrites)
 # ✅ Quotes page: Refresh button; Save (update existing) or Generate New Copy
 # ✅ New Quote tab: always shows *next available* Quote # (+ "↻ Next #" button)
+# ✅ New Quote tab: Download button at the *bottom-right* under the table
 # ✅ Word doc: clean Company (strip numeric prefix), vendor, Ship/Bill addresses
 # ✅ Bill To: from addresses (Billing + contact/email/phone)
 # ✅ Ship To: from addresses (Location/Company) + user contact (user_contacts/User_Data/user_data)
@@ -35,7 +36,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-QUOTES-FRESHNO"
+APP_VERSION = "2025.10.20-BOTTOM-RIGHT-DL"
 
 # ---- deps ----
 try:
@@ -1067,6 +1068,7 @@ else:
                     st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
                     st.rerun()
 
+            # Build default addresses for the selected location
             ship_to, bill_to = build_ship_bill_blocks(DATA_DB_PATH, company_new, str(username))
             c1, c2 = st.columns(2)
             with c1:
@@ -1074,9 +1076,11 @@ else:
             with c2:
                 bill_to = st.text_area("Bill To Address", value=bill_to, height=120, key="new_bill_to")
 
+            # Table with dynamic rows
             initial_rows = [{"Part Number":"", "Description":"", "Quantity":"", "Price/Unit":"", "Total":""} for _ in range(15)]
             if "new_quote_rows" not in st.session_state:
                 st.session_state.new_quote_rows = pd.DataFrame(initial_rows)
+
             edited_new = st.data_editor(
                 st.session_state.new_quote_rows,
                 key="new_quote_editor",
@@ -1091,7 +1095,13 @@ else:
                 }
             )
 
+            # Keep last generated doc in session so the download button lives bottom-right
+            if "new_quote_doc" not in st.session_state:
+                st.session_state["new_quote_doc"] = None
+
+            # Action buttons (no download here)
             c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
+
             with c_save:
                 if st.button("Save", use_container_width=True, key="btn_new_save"):
                     qid, qnum = save_quote_safe(QUOTES_DB_PATH,
@@ -1102,6 +1112,8 @@ else:
                                            lines_df=edited_new)
                     st.success(f"Saved quote #{qid} ({qnum})")
                     st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
+                    st.session_state["new_quote_doc"] = None
+
             with c_gen:
                 if st.button("Generate", use_container_width=True, key="btn_new_generate"):
                     qid, qnum = save_quote_safe(QUOTES_DB_PATH,
@@ -1110,7 +1122,8 @@ else:
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
                                            lines_df=edited_new)
-                    st.success(f"Saved quote #{qid} ({qnum})")
+                    st.success(f"Saved quote #{qid} ({qnum}). Use the download button at the bottom-right.")
+                    # Build the Word file and stash it for the bottom-right download button
                     doc_bytes = build_quote_docx(
                         company=company_new,
                         date_str=datetime.now().strftime("%Y-%m-%d"),
@@ -1118,13 +1131,27 @@ else:
                         vendor_text=vendor, ship_to_text=ship_to, bill_to_text=bill_to,
                         lines_df=edited_new
                     )
-                    st.download_button("Download Quote (Word)", data=doc_bytes,
-                                       file_name=f"{qnum}_{sanitize_filename(company_new)}.docx",
-                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                       key="dl_quote_word_new")
+                    st.session_state["new_quote_doc"] = {
+                        "bytes": doc_bytes,
+                        "name": f"{qnum}_{sanitize_filename(company_new)}.docx"
+                    }
                     st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
+
             with c_email:
                 st.button("Email", use_container_width=True, disabled=True, key="btn_new_email")
+
+            # ---------- Bottom-right download button ----------
+            br_l, br_m, br_r = st.columns([6,3,2])
+            with br_r:
+                doc = st.session_state.get("new_quote_doc")
+                if doc:
+                    st.download_button(
+                        "Download Quote (Word)",
+                        data=doc["bytes"],
+                        file_name=doc["name"],
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="dl_quote_word_new_bottom"
+                    )
 
         # ===== BROWSE / EDIT =====
         with tab_browse:
@@ -1209,7 +1236,7 @@ else:
                                        company=rec["company"],
                                        created_by=str(username),
                                        vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
-                                       lines_df=st.session_state[lines_state_key],   # save edited+added rows
+                                       lines_df=st.session_state[lines_state_key],
                                        quote_id=int(rec["id"]))
                             st.success("Saved changes to existing quote.")
                     with c_gen_new:
