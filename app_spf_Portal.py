@@ -2,16 +2,14 @@
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
 #
-# ✅ Save quotes to SQLite table 'quotes' and download Word on Generate
-# ✅ Remove numeric "### -" prefix from Company ONLY in Word document
-# ✅ Billing from 'addresses' (Billing, Billing Contact, BillingEmail, BillingPhone)
-# ✅ Ship To from 'addresses' + user contact (user_contacts / User_Data / user_data)
-# ✅ RE-STOCK XLSX download kept
-# ✅ Cart buttons: Remove (left, small) | Clear, Save, Generate, Email (right, small)
-# ✅ Quotes page: New (choose Location & Vendor, autofill addresses), Browse/Edit (filter by company)
-# ✅ NEW: RE-STOCK user filter (between the table and the cart) to choose requestor before Generate
-# ✅ NEW: Generate always inserts a NEW quote (no overwrites); Browse/Edit has "Generate New Copy"
-# ✅ NEW: Quotes page "Refresh quotes" button; auto-increment quote number on conflicts
+# ✅ Split DBs: source data (maintainx_po.db) vs persistent quotes (quotes.db)
+# ✅ Generate always inserts a NEW quote (no overwrites)
+# ✅ Quotes page: Refresh button; Save (update existing) or Generate New Copy
+# ✅ Word doc: clean Company (strip numeric prefix), vendor, Ship/Bill addresses
+# ✅ Bill To: from addresses (Billing + contact/email/phone)
+# ✅ Ship To: from addresses (Location/Company) + user contact (user_contacts/User_Data/user_data)
+# ✅ RE-STOCK: requestor picker (user filter) before Generate
+# ✅ PRAGMA hardening for SQLite reliability
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -33,7 +31,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-NO-OVERWRITE"
+APP_VERSION = "2025.10.20-QUOTES-SPLIT"
 
 # ---- deps ----
 try:
@@ -54,34 +52,9 @@ except Exception:
 st.set_page_config(page_title="SPF PO Portal", page_icon="📦", layout="wide")
 
 # ---------- Defaults & config ----------
-DEFAULT_DB = "maintainx_po.db"
+DEFAULT_DB = "maintainx_po.db"   # source data (daily overwrite)
+QUOTES_DEFAULT_DB = "quotes.db"  # persistent quotes only
 HERE = Path(__file__).resolve().parent
-ACTIVE_DB_PATH: str | None = None  # set after resolve
-
-CONFIG_TEMPLATE_YAML = """
-credentials:
-  usernames:
-    demo:
-      name: Demo User
-      email: demo@example.com
-      password: "$2b$12$y2J3Y0rRrJ3fA76h2o//mO6F1T0m3b1vS7QhQ4bW5iX9b5b5b5b5e"
-
-cookie:
-  name: spf_po_portal_v3
-  key: super_secret_key_v3
-  expiry_days: 7
-
-access:
-  admin_usernames: [demo]
-  user_companies:
-    demo: ['*']
-
-settings:
-  db_path: ""
-  # parquet:
-  #   restock: /path/to/restock.parquet
-  #   po_outstanding: /path/to/po_outstanding.parquet
-"""
 
 # ---------- helpers ----------
 def to_plain(obj):
@@ -101,13 +74,21 @@ def load_config() -> dict:
         try: return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
         except Exception as e:
             st.error(f"Invalid YAML in app_config.yaml: {e}"); return {}
-    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
+    # fallback template
+    return {
+        "settings": {"db_path": str((HERE/DEFAULT_DB).resolve()),
+                     "quotes_db_path": str((HERE/QUOTES_DEFAULT_DB).resolve())},
+        "access": {"admin_usernames": ["demo"], "user_companies": {"demo": ["*"]}},
+        "cookie": {"name": "spf_po_portal", "key": "change_me", "expiry_days": 7},
+        "credentials": {"usernames": {"demo": {"name": "Demo", "email": "demo@example.com", "password": ""}}}
+    }
 
 def resolve_db_path(cfg: dict) -> str:
+    """Source data DB: can come from YAML, env, GitHub fallback, or default."""
     yaml_db = (cfg or {}).get('settings', {}).get('db_path')
-    if yaml_db: return str(Path(yaml_db).expanduser())
+    if yaml_db: return str(Path(yaml_db).expanduser().resolve())
     env_db = os.environ.get('SPF_DB_PATH')
-    if env_db: return env_db
+    if env_db: return str(Path(env_db).expanduser().resolve())
     gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
     if gh:
         try:
@@ -117,7 +98,15 @@ def resolve_db_path(cfg: dict) -> str:
             )
         except Exception as e:
             st.error(f"Failed to download DB from GitHub: {e}")
-    return DEFAULT_DB
+    return str((HERE / DEFAULT_DB).resolve())
+
+def resolve_quotes_db_path(cfg: dict) -> str:
+    """Quotes DB: MUST be local/persistent (never from GitHub)."""
+    yaml_q = (cfg or {}).get('settings', {}).get('quotes_db_path')
+    if yaml_q: return str(Path(yaml_q).expanduser().resolve())
+    env_q = os.environ.get('SPF_QUOTES_DB_PATH')
+    if env_q: return str(Path(env_q).expanduser().resolve())
+    return str((HERE / QUOTES_DEFAULT_DB).resolve())
 
 def download_db_from_github(*, repo: str, path: str, branch: str='main', token: str|None=None) -> str:
     if not repo or not path: raise ValueError("Missing repo/path for GitHub download.")
@@ -128,9 +117,47 @@ def download_db_from_github(*, repo: str, path: str, branch: str='main', token: 
     r = requests.get(url, headers=headers, timeout=30)
     if r.status_code != 200: raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
     tmpdir = Path(tempfile.gettempdir()) / "spf_po_cache"; tmpdir.mkdir(parents=True, exist_ok=True)
-    out = tmpdir / "maintainx_po.db"; out.write_bytes(r.content); return str(out)
+    out = tmpdir / DEFAULT_DB
+    if not out.exists() or out.stat().st_size == 0:
+        out.write_bytes(r.content)
+    return str(out.resolve())
 
-# ---------- Parquet detection ----------
+# ---------- SQLite helpers & PRAGMAs ----------
+def open_conn(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+    return conn
+
+def _db_sig(db_path: str) -> int:
+    try: return Path(db_path).stat().st_mtime_ns
+    except Exception: return 0
+
+@st.cache_data(show_spinner=False)
+def q_cached(sql: str, params: Tuple, db_path: str, db_sig: int) -> pd.DataFrame:
+    with open_conn(db_path) as conn:
+        return pd.read_sql_query(sql, conn, params=params)
+
+def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
+    path = db_path or DATA_DB_PATH
+    return q_cached(sql, tuple(params), path, _db_sig(path))
+
+@st.cache_data(show_spinner=False)
+def table_columns_in_order_cached(db_path: str, table: str, db_sig: int) -> list[str]:
+    with open_conn(db_path) as conn:
+        rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+    return [r[1] for r in rows]
+
+def table_columns_in_order(db_path: str | None, table: str) -> list[str]:
+    path = db_path or DATA_DB_PATH
+    return table_columns_in_order_cached(path, table, _db_sig(path))
+
+# ---------- Parquet detection (optional) ----------
 def detect_parquet_paths(cfg: dict) -> Dict[str, Optional[Path]]:
     p_cfg = (cfg.get('settings', {}) or {}).get('parquet', {}) or {}
     def as_path(x):
@@ -138,17 +165,6 @@ def detect_parquet_paths(cfg: dict) -> Dict[str, Optional[Path]]:
         except Exception: return None
     restock = as_path(p_cfg.get('restock')) if p_cfg else None
     po_out  = as_path(p_cfg.get('po_outstanding')) if p_cfg else None
-    if not restock:
-        env = os.environ.get('SPF_RESTOCK_PARQUET'); restock = as_path(env) if env else None
-    if not po_out:
-        env = os.environ.get('SPF_PO_PARQUET'); po_out = as_path(env) if env else None
-    base = os.environ.get('SPF_PARQUET_DIR')
-    if base and not restock: restock = as_path(Path(base)/"restock.parquet")
-    if base and not po_out:  po_out  = as_path(Path(base)/"po_outstanding.parquet")
-    if not restock:
-        cand = HERE / "restock.parquet"; restock = cand if cand.exists() else None
-    if not po_out:
-        cand = HERE / "po_outstanding.parquet"; po_out = cand if cand.exists() else None
     if restock and not restock.exists(): restock = None
     if po_out  and not po_out.exists():  po_out  = None
     return {"restock": restock, "po_outstanding": po_out}
@@ -166,30 +182,6 @@ def read_parquet_cached(path_str: str, sig: int) -> pd.DataFrame:
 
 def parquet_available_for(src: str, pq_paths: Dict[str, Optional[Path]]) -> Optional[Path]:
     p = pq_paths.get(src); return p if p and p.exists() else None
-
-# ---------- SQLite helpers ----------
-def _db_sig(db_path: str) -> int:
-    try: return Path(db_path).stat().st_mtime_ns
-    except Exception: return 0
-
-@st.cache_data(show_spinner=False)
-def q_cached(sql: str, params: Tuple, db_path: str, db_sig: int) -> pd.DataFrame:
-    with sqlite3.connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
-
-def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
-    path = db_path or ACTIVE_DB_PATH or DEFAULT_DB
-    return q_cached(sql, tuple(params), path, _db_sig(path))
-
-@st.cache_data(show_spinner=False)
-def table_columns_in_order_cached(db_path: str, table: str, db_sig: int) -> list[str]:
-    with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-    return [r[1] for r in rows]
-
-def table_columns_in_order(db_path: str | None, table: str) -> list[str]:
-    path = db_path or ACTIVE_DB_PATH or DEFAULT_DB
-    return table_columns_in_order_cached(path, table, _db_sig(path))
 
 # ---- keys & misc ----
 KEY_COL_CANDIDATES = ["ID","id","Purchase Order ID","Row ID","RowID"]
@@ -224,9 +216,9 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
                 pass
     return buf.getvalue()
 
-# ---------- Quote storage ----------
+# ---------- Quote storage (lives in QUOTES DB) ----------
 def ensure_quotes_table(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with open_conn(db_path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS quotes (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -248,7 +240,7 @@ def ensure_quotes_table(db_path: str) -> None:
 def quotes_count(db_path: str) -> int:
     ensure_quotes_table(db_path)
     try:
-        with sqlite3.connect(db_path) as conn:
+        with open_conn(db_path) as conn:
             v = conn.execute("SELECT COUNT(*) FROM quotes").fetchone()[0]
         return int(v)
     except Exception:
@@ -266,7 +258,7 @@ def _parse_year_and_seq(qn: str) -> Tuple[Optional[int], Optional[int]]:
 def _next_quote_number(db_path: str, date_obj: datetime) -> str:
     yr = date_obj.strftime("%Y")
     ensure_quotes_table(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with open_conn(db_path) as conn:
         rows = conn.execute("SELECT quote_number FROM quotes WHERE quote_number LIKE ?", (f"QR-{yr}-%",)).fetchall()
     used = set()
     for (qn,) in rows:
@@ -293,7 +285,7 @@ def save_quote(db_path: str, *, quote_number: Optional[str], company: str, creat
     lines = _coerce_lines_for_storage(lines_df).fillna("").astype(str)
     payload = json.dumps(lines.to_dict(orient="records"), ensure_ascii=False)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(db_path) as conn:
+    with open_conn(db_path) as conn:
         if quote_id is None:
             conn.execute("""
                 INSERT INTO quotes(quote_number, company, created_by, vendor, ship_to, bill_to,
@@ -315,23 +307,17 @@ def save_quote(db_path: str, *, quote_number: Optional[str], company: str, creat
             return int(quote_id), quote_number
 
 def save_quote_safe(db_path: str, **kwargs) -> Tuple[int, str]:
-    """
-    Always create a new quote if possible. If a duplicate quote_number was provided,
-    auto-pick the next available number and insert a fresh row.
-    """
+    """Always create a new quote if duplicate number hits UNIQUE."""
     try:
         return save_quote(db_path, **kwargs)
     except sqlite3.IntegrityError:
-        # quote_number conflict -> generate a fresh one
         new_no = _next_quote_number(db_path, datetime.utcnow())
-        kwargs = dict(kwargs)
-        kwargs["quote_number"] = new_no
-        kwargs["quote_id"] = None
+        kwargs = dict(kwargs); kwargs["quote_number"] = new_no; kwargs["quote_id"] = None
         return save_quote(db_path, **kwargs)
 
 def load_quote(db_path: str, quote_id: int) -> Optional[dict]:
     ensure_quotes_table(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with open_conn(db_path) as conn:
         row = conn.execute("SELECT * FROM quotes WHERE id=?", (quote_id,)).fetchone()
     if not row: return None
     cols = ["id","quote_number","company","created_by","vendor","ship_to","bill_to",
@@ -345,7 +331,7 @@ def load_quote(db_path: str, quote_id: int) -> Optional[dict]:
 
 def list_quotes(db_path: str, company: Optional[str]=None, include_all: bool=False) -> pd.DataFrame:
     ensure_quotes_table(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with open_conn(db_path) as conn:
         if company and not include_all:
             df = pd.read_sql_query(
                 "SELECT id, quote_number, quote_date, vendor, status, source, length(lines_json) as bytes, company "
@@ -356,19 +342,16 @@ def list_quotes(db_path: str, company: Optional[str]=None, include_all: bool=Fal
                 "FROM quotes ORDER BY id DESC", conn)
     return df
 
-# ---------- Addresses & contacts ----------
+# ---------- Addresses & contacts (from DATA DB) ----------
 @st.cache_data(show_spinner=False)
 def _load_table(db_path: str, name: str) -> pd.DataFrame:
     try:
-        with sqlite3.connect(db_path) as conn:
+        with open_conn(db_path) as conn:
             return pd.read_sql_query(f"SELECT * FROM [{name}]", conn)
     except Exception:
         return pd.DataFrame()
 
 def _user_table(db_path: str) -> Tuple[pd.DataFrame, str]:
-    """
-    Prefer modern user table 'user_contacts', else fall back to legacy 'User_Data' or 'user_data'.
-    """
     for nm in ["user_contacts", "User_Data", "user_data"]:
         df = _load_table(db_path, nm)
         if not df.empty:
@@ -401,24 +384,20 @@ def remove_prefix_for_display(company: str) -> str:
 def _match_user_contact(df: pd.DataFrame, company: str, username: str) -> Tuple[str,str,str]:
     """
     STRICT username-only contact lookup. Ignores company.
-    Returns (Contact, Email, Phone). If no exact username match, returns blanks.
+    Returns (Contact, Email, Phone). If no exact username match, blanks.
     """
     if df.empty or not str(username).strip():
         return ("", "", "")
-
     user_col    = _pick_first_col(df, ["UserName","Username","User","Login","Email","User Name"])
     contact_col = _pick_first_col(df, ["Contact","Name"]) or "Contact"
     email_col   = _pick_first_col(df, ["Email"]) or "Email"
     phone_col   = "Phone" if "Phone" in df.columns else (_pick_first_col(df, ["Phone2","Cell","Telephone"]) or "Phone")
-
     if not user_col or user_col not in df.columns:
         return ("", "", "")
-
     mask = df[user_col].astype(str).str.strip().str.casefold() == str(username).strip().casefold()
     narrowed = df[mask]
     if narrowed.empty:
         return ("", "", "")
-
     row = narrowed.iloc[0]
     return (
         str(row.get(contact_col, "") or "").strip(),
@@ -428,20 +407,15 @@ def _match_user_contact(df: pd.DataFrame, company: str, username: str) -> Tuple[
 
 def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[str, str]:
     """
-    Ship To (for DOC ONLY):
-      - Prefer addresses row where addresses.Location == selected label (e.g., "110 - Deckers Creek Limestone").
-      - Else match addresses.Company == prefix-stripped label ("Deckers Creek Limestone").
-      - First printed line: addresses.Company (clean name, no numeric prefix).
-      - Address lines: Address, Address 2 (if present).
-      - City/State/Zip: prefer combined column "City,Sate,Zip" (your exact header), else compose City/State(ZIP).
-      - Append user contact strictly by username.
-    Bill To:
-      - Use addresses.Billing (semicolon → lines) plus BillingContact, BillingEmail, BillingPhone.
+    Ship To: match addresses row by Location==company (preferred) or Company==clean(company);
+             print clean Company first; Address, Address2; combined City/State/Zip if available;
+             append user contact strictly by username.
+    Bill To: addresses.Billing (split ;) + BillingContact/BillingEmail/BillingPhone.
     """
     adr = _load_table(db_path, "addresses")
     user_df, _ = _user_table(db_path)
 
-    # ---- Bill To ----
+    # Bill To
     bill_lines: List[str] = []
     if not adr.empty and "Billing" in adr.columns:
         rows_with = adr[adr["Billing"].astype(str).str.strip() != ""]
@@ -457,19 +431,19 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
         if b_phone:   bill_lines.append(f"Phone: {b_phone}")
     bill_txt = "\n".join([ln for ln in bill_lines if ln])
 
-    # ---- Ship To ----
+    # Ship To
     ship_lines: List[str] = []
     arow = pd.Series(dtype="object")
     printed_company = remove_prefix_for_display(company)
 
     if not adr.empty:
-        # 1) Try exact match on Location
+        # 1) Try exact Location
         loc_col = _pick_first_col(adr, ["Location"])
         if loc_col and (loc_col in adr.columns):
             mloc = adr[loc_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
             if mloc.any():
                 arow = adr[mloc].iloc[0]
-        # 2) Else try clean Company match
+        # 2) Fallback to Company (cleaned)
         if arow.empty:
             comp_col = _pick_first_col(adr, ["Company"])
             if comp_col and (comp_col in adr.columns):
@@ -481,24 +455,22 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
 
     ship_lines.append(str(printed_company).strip())
 
-    # Address lines
+    # Address 1/2
     def _first_nonempty(row, keys):
         for k in keys:
             if k in row.index and str(row.get(k,"")).strip():
                 return str(row.get(k)).strip()
         return ""
-
     addr1 = _first_nonempty(arow, ["Address","Address 1","Address1","Street","Line1"])
     if addr1: ship_lines.append(addr1)
     addr2 = _first_nonempty(arow, ["Address 2","Address2","Line2","Street 2"])
     if addr2: ship_lines.append(addr2)
 
-    # City/State/Zip combined preferred
+    # City/State/Zip (prefer combined)
     combined = ""
     for cand in ["City,Sate,Zip","City,State,Zip","City_State_Zip","City, ST Zip","City State Zip"]:
         if cand in arow.index and str(arow.get(cand,"")).strip():
-            combined = str(arow.get(cand)).strip()
-            break
+            combined = str(arow.get(cand)).strip(); break
     if combined:
         ship_lines.append(combined)
     else:
@@ -511,7 +483,7 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
             else:
                 ship_lines.append(_join_nonempty(city, state, zipc, sep=' '))
 
-    # Append contact by username
+    # Contact appended by username
     c_name, c_email, c_phone = _match_user_contact(user_df, printed_company, username)
     if c_name:  ship_lines.append(c_name)
     if c_email: ship_lines.append(c_email)
@@ -563,7 +535,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     vr = doc.add_paragraph(); vr.add_run("Vendor").bold = True
     doc.add_paragraph(vendor_text if vendor_text.strip() else "_____________________________")
 
-    # Addresses (Ship/Bill)
+    # Addresses
     doc.add_paragraph("")
     tbl_addr = doc.add_table(rows=2, cols=2)
     hdr = tbl_addr.rows[0].cells
@@ -627,14 +599,14 @@ def label_for_source(engine: str, path: Optional[str]) -> str:
             return "Engine: Parquet"
     return "Engine: SQLite"
 
-# ---------- App ----------
+# ============================ APP ============================
 cfg = load_config(); cfg = to_plain(cfg)
 
 cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
-    cookie_cfg.get('name', 'spf_po_portal_v3'),
-    cookie_cfg.get('key',  'super_secret_key_v3'),
+    cookie_cfg.get('name', 'spf_po_portal'),
+    cookie_cfg.get('key',  'change_me_in_yaml'),
     cookie_cfg.get('expiry_days', 7),
 )
 name, auth_status, username = auth.login("Login", "main")
@@ -647,9 +619,10 @@ else:
     auth.logout('Logout', 'sidebar')
     st.sidebar.success(f"Logged in as {name}")
 
-    # Resolve DB path + expose in UI
-    db_path = resolve_db_path(cfg)
-    ACTIVE_DB_PATH = db_path
+    # Resolve DB paths
+    DATA_DB_PATH = resolve_db_path(cfg)              # daily source data (you overwrite)
+    QUOTES_DB_PATH = resolve_quotes_db_path(cfg)     # persistent quotes DB (do not overwrite)
+
     pq_paths = detect_parquet_paths(cfg)
 
     # Sidebar info
@@ -657,8 +630,9 @@ else:
         "parquet" if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else "sqlite",
         str(pq_paths.get("restock") or pq_paths.get("po_outstanding")) if (pq_paths.get("restock") or pq_paths.get("po_outstanding")) else None
     ))
-    st.sidebar.caption(f"DB used for quotes: `{Path(db_path).resolve()}`")
-    st.sidebar.caption(f"Quotes in DB: **{quotes_count(db_path)}**")
+    st.sidebar.caption(f"Data DB (source): `{Path(DATA_DB_PATH).resolve()}`")
+    st.sidebar.caption(f"Quotes DB: `{Path(QUOTES_DB_PATH).resolve()}`")
+    st.sidebar.caption(f"Quotes in DB: **{quotes_count(QUOTES_DB_PATH)}**")
     if st.sidebar.button("🔄 Refresh data"): st.cache_data.clear()
 
     page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0)
@@ -673,9 +647,9 @@ else:
             all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
             return df_all, cols_in_db, all_companies, pq_path
         else:
-            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1")
+            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1", db_path=DATA_DB_PATH)
             all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
-            cols_in_db = table_columns_in_order(None, src)
+            cols_in_db = table_columns_in_order(DATA_DB_PATH, src)
             return None, cols_in_db, all_companies, None
 
     _, cols_any, all_companies, _ = load_src("restock")
@@ -739,7 +713,7 @@ else:
             order_cols = [c for c in ["Company","Name"] if c in df.columns]
             df = df.sort_values(order_cols) if order_cols else df
         else:
-            cols_in_db = table_columns_in_order(None, src)
+            cols_in_db = table_columns_in_order(DATA_DB_PATH, src)
             vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
             label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
             search = st.sidebar.text_input(label)
@@ -753,7 +727,7 @@ else:
                     params += [f"%{search}%"]*2
             where_sql = " AND ".join(where)
             sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], [Name]"
-            df = q(sql, tuple(params))
+            df = q(sql, tuple(params), db_path=DATA_DB_PATH)
 
         df = strip_time(df, DATE_COLS.get(src, [])); df = attach_row_key(df)
         hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__","__QTY__"}
@@ -799,7 +773,6 @@ else:
                 diff = (m - s).clip(lower=0); return diff.apply(lambda x: "" if pd.isna(x) else str(int(float(x))) if float(x).is_integer() else str(x))
             add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
 
-            vendor_col = vendor_col
             if vendor_col:
                 sel_vendors = sorted(set(add_df[vendor_col].dropna().astype(str).str.strip()))
                 cart_df = st.session_state[cart_key]
@@ -833,7 +806,7 @@ else:
 
         # ---- Requestor picker (contact for Ship To) ----
         try:
-            udf, udf_name = _user_table(ACTIVE_DB_PATH)
+            udf, udf_name = _user_table(DATA_DB_PATH)
         except Exception:
             udf, udf_name = (pd.DataFrame(), "user_contacts")
         user_col = _pick_first_col(udf, ["UserName","Username","User","Login","Email","User Name"]) or "UserName"
@@ -841,7 +814,6 @@ else:
             requestor_options = sorted(udf[user_col].dropna().astype(str).unique().tolist())
         else:
             requestor_options = [str(username)]
-        # default to logged-in username if present
         try:
             default_idx = requestor_options.index(str(username))
         except ValueError:
@@ -927,7 +899,7 @@ else:
             st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns)+["__QTY__"])
             st.session_state[cart_base] += 1; st.rerun()
 
-        # Generate: save NEW quote, then present download
+        # Generate: save NEW quote to QUOTES DB, then present download
         if gen_clicked:
             if st.session_state[cart_key].empty:
                 st.warning("Cart is empty.")
@@ -950,7 +922,7 @@ else:
                     "Total":       ""
                 })
 
-                # Derive Location (must be single)
+                # Derive location for save
                 company_for_save = None
                 if 'Company' in st.session_state[cart_key].columns:
                     cart_companies = (
@@ -968,12 +940,11 @@ else:
                     company_for_save = chosen if chosen != ADMIN_ALL else '(unknown)'
 
                 use_user = st.session_state.get("contact_user_override", str(username))
-                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, use_user)
+                ship_to, bill_to = build_ship_bill_blocks(DATA_DB_PATH, company_for_save, use_user)
 
-                # Always insert a NEW quote number
-                next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
+                next_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote_safe(
-                    ACTIVE_DB_PATH,
+                    QUOTES_DB_PATH,
                     quote_number=next_no,
                     company=company_for_save,
                     created_by=str(username),
@@ -1032,10 +1003,10 @@ else:
                 params += [f"%{search}%"]*4
             where_sql = " AND ".join(where)
             sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
-            df = q(sql, tuple(params))
+            df = q(sql, tuple(params), db_path=DATA_DB_PATH)
         df = strip_time(df, DATE_COLS.get(src, [])); df = attach_row_key(df)
         hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__","__QTY__"}
-        cols_for_download = [c for c in table_columns_in_order(None, src) if (c in df.columns) and (c not in hide_set)]
+        cols_for_download = [c for c in table_columns_in_order(DATA_DB_PATH, src) if (c in df.columns) and (c not in hide_set)]
         display_cols = [c for c in cols_for_download if c != "Company"]
         st.markdown(f"### Outstanding POs — {title_companies}")
         st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
@@ -1048,14 +1019,14 @@ else:
     # ----------------- Quotes (New / Browse-Edit) -----------------
     else:
         st.markdown(f"### Quotes — {title_companies}")
-        ensure_quotes_table(ACTIVE_DB_PATH)
+        ensure_quotes_table(QUOTES_DB_PATH)
 
         # Quick refresh for this page only
         r1, r2 = st.columns([1,6])
         if r1.button("🔄 Refresh quotes"):
             st.cache_data.clear()
             st.rerun()
-        r2.caption(f"DB: {Path(ACTIVE_DB_PATH).resolve()} • Total: {quotes_count(ACTIVE_DB_PATH)}")
+        r2.caption(f"DB: {Path(QUOTES_DB_PATH).resolve()} • Total: {quotes_count(QUOTES_DB_PATH)}")
 
         include_all = is_admin  # admins default to seeing all
         if is_admin:
@@ -1064,7 +1035,7 @@ else:
         tab_new, tab_browse = st.tabs(["🆕 New Quote", "📁 Browse / Edit"])
 
         # Load Vendors list if present
-        vendors_df = _load_table(ACTIVE_DB_PATH, "vendors")
+        vendors_df = _load_table(DATA_DB_PATH, "vendors")
         vendor_names = sorted(vendors_df["Vendor"].dropna().astype(str).unique().tolist()) if ("Vendor" in vendors_df.columns and not vendors_df.empty) else []
 
         # NEW QUOTE
@@ -1077,10 +1048,10 @@ else:
                 vendor = st.text_input("Vendor", value="")
 
             if "new_quote_no" not in st.session_state:
-                st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
+                st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
             quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no, help="QR-YYYY-####")
 
-            ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_new, str(username))
+            ship_to, bill_to = build_ship_bill_blocks(DATA_DB_PATH, company_new, str(username))
             c1, c2 = st.columns(2)
             with c1:
                 ship_to = st.text_area("Ship To Address", value=ship_to, height=120)
@@ -1106,17 +1077,17 @@ else:
             c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
             with c_save:
                 if st.button("Save", use_container_width=True):
-                    qid, qnum = save_quote_safe(ACTIVE_DB_PATH,
+                    qid, qnum = save_quote_safe(QUOTES_DB_PATH,
                                            quote_number=(quote_no or None),
                                            company=company_new,
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
                                            lines_df=edited_new)
                     st.success(f"Saved quote #{qid} ({qnum})")
-                    st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
+                    st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
             with c_gen:
                 if st.button("Generate", use_container_width=True):
-                    qid, qnum = save_quote_safe(ACTIVE_DB_PATH,
+                    qid, qnum = save_quote_safe(QUOTES_DB_PATH,
                                            quote_number=(quote_no or None),
                                            company=company_new,
                                            created_by=str(username),
@@ -1133,14 +1104,14 @@ else:
                     st.download_button("Download Quote (Word)", data=doc_bytes,
                                        file_name=f"{qnum}_{sanitize_filename(company_new)}.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                    st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
+                    st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
             with c_email:
                 st.button("Email", use_container_width=True, disabled=True)
 
         # BROWSE / EDIT
         with tab_browse:
             comp_filter = st.selectbox("Filter by Company", options=["(all)"] + company_options, index=0)
-            dfq = list_quotes(ACTIVE_DB_PATH,
+            dfq = list_quotes(QUOTES_DB_PATH,
                               company=(None if comp_filter=="(all)" else comp_filter),
                               include_all=(include_all or comp_filter=="(all)"))
             if dfq.empty:
@@ -1151,11 +1122,11 @@ else:
                                       min_value=int(dfq["id"].min()),
                                       max_value=int(dfq["id"].max()),
                                       value=int(dfq["id"].max()), step=1)
-                rec = load_quote(ACTIVE_DB_PATH, int(qid))
+                rec = load_quote(QUOTES_DB_PATH, int(qid))
                 if not rec:
                     st.warning("Quote not found.")
                 else:
-                    quote_no = st.text_input("Quote #", value=rec["quote_number"] or _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow()))
+                    quote_no = st.text_input("Quote #", value=rec["quote_number"] or _next_quote_number(QUOTES_DB_PATH, datetime.utcnow()))
                     vendor   = st.text_input("Vendor", value=rec["vendor"] or "")
                     c1, c2 = st.columns(2)
                     with c1:
@@ -1179,8 +1150,7 @@ else:
                     c_left, c_sp, c_save, c_gen_new, c_email = st.columns([4,5,1,1,1])
                     with c_save:
                         if st.button("Save (update existing)", key=f"save_quote_{rec['id']}", use_container_width=True):
-                            # This UPDATE modifies the current record
-                            save_quote(ACTIVE_DB_PATH, quote_number=quote_no or None,
+                            save_quote(QUOTES_DB_PATH, quote_number=quote_no or None,
                                        company=rec["company"],
                                        created_by=str(username),
                                        vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
@@ -1188,9 +1158,8 @@ else:
                             st.success("Saved changes to existing quote.")
                     with c_gen_new:
                         if st.button("Generate New Copy", key=f"gen_new_{rec['id']}", use_container_width=True):
-                            # This INSERT creates a NEW record with a fresh number
-                            new_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
-                            qid2, qnum2 = save_quote_safe(ACTIVE_DB_PATH, quote_number=new_no,
+                            new_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
+                            qid2, qnum2 = save_quote_safe(QUOTES_DB_PATH, quote_number=new_no,
                                                      company=rec["company"],
                                                      created_by=str(username),
                                                      vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
@@ -1207,11 +1176,8 @@ else:
                                                file_name=f"{qnum2}_{sanitize_filename(rec['company'])}.docx",
                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                                key=f"gen_dl_{rec['id']}")
+
                     with c_email:
                         st.button("Email", use_container_width=True, disabled=True)
 
-    # ---------- Config template (admins only) ----------
-    if is_admin:
-        with st.expander('ℹ️ Config template'):
-            st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
 
