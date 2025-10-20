@@ -2,12 +2,11 @@
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
 #
-# ✅ Save quotes to SQLite table 'quotes' and download Word on Generate
-# ✅ Remove numeric "### -" prefix from Company ONLY in Word document
-# ✅ Billing from 'addresses' (Billing, Billing Contact, BillingEmail, BillingPhone)
-# ✅ Ship To from 'addresses' + user contact (User_Data / user_data)
-# ✅ RE-STOCK XLSX download kept
-# ✅ Cart buttons: Remove (left, small) | Clear, Save, Generate, Email (right, small)
+# ✅ Saves quotes to SQLite table 'quotes' and downloads Word on Generate
+# ✅ Removes numeric "### -" prefix from Company ONLY in Word document
+# ✅ Ship To: from 'addresses' (Company -> Address1/Address2/City/State/Zip) + user contact from 'user_data'
+# ✅ Bill To: fixed, same for all companies (can be overridden via config)
+# ✅ RE-STOCK XLSX download kept; Cart buttons: Remove | Clear | Save | Generate
 # ✅ Quotes page: New (choose Location & Vendor, autofill addresses), Browse/Edit (filter by company)
 #
 # requirements.txt (min):
@@ -21,16 +20,16 @@
 #   requests>=2.31
 #   pyarrow>=17.0   # or fastparquet
 from __future__ import annotations
-import os, io, re, json, sqlite3, textwrap, hashlib
+import os, io, re, json, sqlite3, textwrap, hashlib, tempfile
 from pathlib import Path
 from collections.abc import Mapping, Iterable
 from typing import Optional, List, Tuple, Dict
 from datetime import datetime, timezone
+
 import pandas as pd
 import streamlit as st
-import yaml
 
-APP_VERSION = "2025.10.19-FINAL"
+APP_VERSION = "2025.10.20"
 
 # ---- deps ----
 try:
@@ -55,12 +54,22 @@ DEFAULT_DB = "maintainx_po.db"
 HERE = Path(__file__).resolve().parent
 ACTIVE_DB_PATH: str | None = None  # set after resolve
 
+# Fixed Bill-To (global default). You can override via secrets['app_config']['billing']['lines']
+BILL_TO_FIXED = [
+    "P.O. Box 1900",
+    "Morgantown, WV, 26507",
+    "Heather Page — Accounts Payable",
+    "hpage@greerindustries.com",
+    "Phone: (304) 594-1768",
+]
+
 CONFIG_TEMPLATE_YAML = """
 credentials:
   usernames:
     demo:
       name: Demo User
       email: demo@example.com
+      # bcrypt hash for 'demo'
       password: "$2b$12$y2J3Y0rRrJ3fA76h2o//mO6F1T0m3b1vS7QhQ4bW5iX9b5b5b5b5e"
 
 cookie:
@@ -75,9 +84,14 @@ access:
 
 settings:
   db_path: ""
-  # parquet:
-  #   restock: /path/to/restock.parquet
-  #   po_outstanding: /path/to/po_outstanding.parquet
+
+billing:
+  lines:
+    - "P.O. Box 1900"
+    - "Morgantown, WV, 26507"
+    - "Heather Page — Accounts Payable"
+    - "hpage@greerindustries.com"
+    - "Phone: (304) 594-1768"
 """
 
 # ---------- helpers ----------
@@ -87,67 +101,53 @@ def to_plain(obj):
     return obj
 
 def load_config() -> dict:
+    # Prefer Streamlit secrets; fallback to app_config.yaml; else template
     if "app_config" in st.secrets:
         return to_plain(st.secrets["app_config"])
     if "app_config_yaml" in st.secrets:
-        try: return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
+        try: return yaml_safe_load(st.secrets["app_config_yaml"]) or {}
         except Exception as e:
-            st.error(f"Invalid YAML in app_config_yaml secret: {e}"); return {}
+            st.error(f"Invalid YAML in app_config_yaml secret: {e}")
+            return {}
     cfg_file = HERE / "app_config.yaml"
     if cfg_file.exists():
-        try: return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+        try: return yaml_safe_load(cfg_file.read_text(encoding="utf-8")) or {}
         except Exception as e:
-            st.error(f"Invalid YAML in app_config.yaml: {e}"); return {}
-    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
+            st.error(f"Invalid YAML in app_config.yaml: {e}")
+            return {}
+    # minimal template
+    return {}
+
+# safe YAML (no need for full yaml import unless provided)
+def yaml_safe_load(text: str) -> dict:
+    try:
+        import yaml
+        return yaml.safe_load(text)
+    except Exception:
+        return {}
 
 def resolve_db_path(cfg: dict) -> str:
     yaml_db = (cfg or {}).get('settings', {}).get('db_path')
     if yaml_db: return yaml_db
     env_db = os.environ.get('SPF_DB_PATH')
     if env_db: return env_db
-    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh:
-        try:
-            return download_db_from_github(
-                repo=gh.get('repo'), path=gh.get('path'),
-                branch=gh.get('branch','main'), token=gh.get('token'),
-            )
-        except Exception as e:
-            st.error(f"Failed to download DB from GitHub: {e}")
+    # Fallback: local file
     return DEFAULT_DB
-
-def download_db_from_github(*, repo: str, path: str, branch: str='main', token: str|None=None) -> str:
-    if not repo or not path: raise ValueError("Missing repo/path for GitHub download.")
-    import requests, tempfile
-    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
-    headers = {"Accept": "application/vnd.github.v3.raw"}
-    if token: headers["Authorization"] = f"token {token}"
-    r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code != 200: raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
-    tmpdir = Path(tempfile.gettempdir()) / "spf_po_cache"; tmpdir.mkdir(parents=True, exist_ok=True)
-    out = tmpdir / "maintainx_po.db"; out.write_bytes(r.content); return str(out)
 
 # ---------- Parquet detection ----------
 def detect_parquet_paths(cfg: dict) -> Dict[str, Optional[Path]]:
-    p_cfg = (cfg.get('settings', {}) or {}).get('parquet', {}) or {}
+    # env overrides or colocated files
     def as_path(x):
         try: return Path(str(x)).expanduser().resolve()
         except Exception: return None
-    restock = as_path(p_cfg.get('restock')) if p_cfg else None
-    po_out  = as_path(p_cfg.get('po_outstanding')) if p_cfg else None
+    restock = as_path(os.environ.get('SPF_RESTOCK_PARQUET') or "")
+    po_out  = as_path(os.environ.get('SPF_PO_PARQUET') or "")
     if not restock:
-        env = os.environ.get('SPF_RESTOCK_PARQUET'); restock = as_path(env) if env else None
+        cand = HERE / "restock.parquet"
+        restock = cand if cand.exists() else None
     if not po_out:
-        env = os.environ.get('SPF_PO_PARQUET'); po_out = as_path(env) if env else None
-    base = os.environ.get('SPF_PARQUET_DIR')
-    if base and not restock: restock = as_path(Path(base)/"restock.parquet")
-    if base and not po_out:  po_out  = as_path(Path(base)/"po_outstanding.parquet")
-    if not restock:
-        cand = HERE / "restock.parquet"; restock = cand if cand.exists() else None
-    if not po_out:
-        cand = HERE / "po_outstanding.parquet"; po_out = cand if cand.exists() else None
-    if restock and not restock.exists(): restock = None
-    if po_out  and not po_out.exists():  po_out  = None
+        cand = HERE / "po_outstanding.parquet"
+        po_out = cand if cand.exists() else None
     return {"restock": restock, "po_outstanding": po_out}
 
 def _filesig(p: Path) -> int:
@@ -188,40 +188,6 @@ def table_columns_in_order(db_path: str | None, table: str) -> list[str]:
     path = db_path or ACTIVE_DB_PATH or DEFAULT_DB
     return table_columns_in_order_cached(path, table, _db_sig(path))
 
-# ---- keys & misc ----
-KEY_COL_CANDIDATES = ["ID","id","Purchase Order ID","Row ID","RowID"]
-def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
-    df_in = df_in.copy()
-    key_col = next((c for c in KEY_COL_CANDIDATES if c in df_in.columns), None)
-    if key_col:
-        df_in["__KEY__"] = df_in[key_col].astype(str); return df_in
-    cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN","Name","Line Name","Description",
-                        "Vendor","Vendors","Company","Created On"] if c in df_in.columns]
-    if not cols: cols = list(df_in.columns)
-    s = df_in[cols].astype(str).agg("|".join, axis=1)
-    df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
-    return df_in
-
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[^A-Za-z0-9._ -]+', '_', str(name or "")).strip()[:80] or "file"
-
-# ---- Excel simple export ----
-def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
-    import xlsxwriter
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
-        df.to_excel(w, index=False, sheet_name=sheet)
-        ws = w.sheets[sheet]
-        ws.autofilter(0,0,max(0,len(df)), max(0,len(df.columns)-1))
-        for i,_ in enumerate(df.columns):
-            try:
-                width = 16 if df.empty else min(60, max(12, int(df.iloc[:,i].astype(str).str.len().quantile(0.9))+2))
-                ws.set_column(i,i,width)
-            except Exception:
-                pass
-    return buf.getvalue()
-
-# ---------- Quote storage ----------
 def ensure_quotes_table(db_path: str) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
@@ -279,6 +245,11 @@ def _coerce_lines_for_storage(df_lines: pd.DataFrame) -> pd.DataFrame:
     out = df_lines.copy()
     for c in cols:
         if c not in out.columns: out[c] = ""
+    # normalize column names like 'Qty'/'Price'
+    if "Qty" in out.columns and "Quantity" not in out.columns:
+        out["Quantity"] = out["Qty"]
+    if "Price" in out.columns and "Price/Unit" not in out.columns:
+        out["Price/Unit"] = out["Price"]
     return out[cols]
 
 def save_quote(db_path: str, *, quote_number: Optional[str], company: str, created_by: str,
@@ -348,19 +319,22 @@ def _load_table(db_path: str, name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def _user_table(db_path: str) -> Tuple[pd.DataFrame, str]:
-    for nm in ["User_Data", "user_data", "user_contacts"]:
+    # Prefer lowercase 'user_data' per spec
+    for nm in ["user_data", "User_Data", "user_contacts"]:
         df = _load_table(db_path, nm)
         if not df.empty:
             return df, nm
-    return pd.DataFrame(), "User_Data"
+    return pd.DataFrame(), "user_data"
 
 def _pick_first_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     for c in candidates:
         if c in df.columns: return c
     lower = {c.lower(): c for c in df.columns}
     for want in candidates:
+        want_l = str(want).lower()
+        # allow partials: "address", "address 1", "addr1"
         for lc, orig in lower.items():
-            if want.lower() == lc or want.lower() in lc:
+            if want_l == lc or want_l in lc:
                 return orig
     return None
 
@@ -377,96 +351,80 @@ def remove_prefix_for_display(company: str) -> str:
     # Strip leading "### -" (and surrounding spaces) ONLY for the Word doc
     return re.sub(r'^\s*\d+\s*-\s*', '', str(company or "")).strip()
 
-def _match_user_contact(df: pd.DataFrame, company: str, username: str) -> Tuple[str,str,str]:
-    """
-    Return (Contact, Email, Phone) matched by Company and Username (case-insensitive).
-    """
+def _match_user_contact(df: pd.DataFrame, company: str, username: str, fallback_name: str="") -> Tuple[str,str,str]:
+    """Return (Contact, Email, Phone) matched by Company and Username (case-insensitive)."""
     if df.empty:
-        return ("", "", "")
-
+        return (fallback_name, "", "")
     comp_col    = _pick_first_col(df, ["Company","Location","Site","Name"]) or "Company"
     user_col    = _pick_first_col(df, ["Username","User","Login","Email","UserName"])
     contact_col = _pick_first_col(df, ["Contact","Name"]) or "Contact"
     email_col   = _pick_first_col(df, ["Email"]) or "Email"
     phone_col   = _pick_first_col(df, ["Phone","Telephone","Cell"]) or "Phone"
-
     view = df.copy()
-
     # narrow by company
     if comp_col in view.columns:
         mask_company = view[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
         narrowed = view[mask_company]
         if not narrowed.empty:
             view = narrowed
-
     # narrow by username
     if user_col and (user_col in view.columns):
         mask_user = view[user_col].astype(str).str.strip().str.casefold() == str(username).strip().casefold()
         narrowed_user = view[mask_user]
         if not narrowed_user.empty:
             view = narrowed_user
-
     row = view.iloc[0] if not view.empty else df.iloc[0]
-    return (
-        str(row.get(contact_col, "") or "").strip(),
-        str(row.get(email_col, "") or "").strip(),
-        str(row.get(phone_col, "") or "").strip(),
-    )
+    contact = str(row.get(contact_col, fallback_name) or fallback_name).strip()
+    email   = str(row.get(email_col, "") or "").strip()
+    phone   = str(row.get(phone_col, "") or "").strip()
+    return (contact, email, phone)
 
-def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[str, str]:
+def _bill_to_text(cfg: dict) -> str:
+    # Always use fixed Bill-To (either from secrets config or the global default)
+    lines = (cfg.get("billing", {}) or {}).get("lines") or BILL_TO_FIXED
+    # sanitize duplicate "Phone:"
+    cleaned = []
+    for ln in lines:
+        s = str(ln).strip()
+        if not s: continue
+        s = re.sub(r'^\s*Phone:\s*Phone:\s*', 'Phone: ', s, flags=re.I)
+        cleaned.append(s)
+    return "\n".join(cleaned)
+
+def build_ship_bill_blocks(db_path: str, company: str, username: str, cfg: dict, fallback_contact: str="") -> Tuple[str, str]:
     """
     Ship To (for DOC ONLY): Company (prefix removed), Address(1/2), City/State Zip,
-    then user Contact/Email/Phone from User_Data.
-    Bill To: 'Billing' (semicolon→lines) + Billing Contact/Email/Phone.
+    then user Contact/Email/Phone from user_data.
+    Bill To: fixed (from config.billing.lines or BILL_TO_FIXED).
     """
     adr = _load_table(db_path, "addresses")
     user_df, _ = _user_table(db_path)
 
-    # ---- Bill To ----
-    bill_lines: List[str] = []
-    if not adr.empty:
-        # Use first nonempty Billing field as the multi-line body
-        if "Billing" in adr.columns:
-            billing_text = ""
-            # prefer a row with Billing filled; else any row
-            rows_with = adr[adr["Billing"].astype(str).str.strip() != ""]
-            row_b = rows_with.iloc[0] if not rows_with.empty else adr.iloc[0]
-            billing_text = str(row_b.get("Billing","")).strip()
-            if billing_text:
-                bill_lines.extend(_split_semicolon_lines(billing_text))
-
-            # append contact/email/phone if present (optional)
-            b_contact = str(row_b.get(_pick_first_col(adr, ["Billing Contact","BillingContact"]) or "", "")).strip()
-            b_email   = str(row_b.get(_pick_first_col(adr, ["BillingEmail","Billing Email"]) or "", "")).strip()
-            b_phone   = str(row_b.get(_pick_first_col(adr, ["BillingPhone","Billing Phone"]) or "", "")).strip()
-            if b_contact: bill_lines.append(b_contact)
-            if b_email:   bill_lines.append(b_email)
-            if b_phone:   bill_lines.append(f"Phone: {b_phone}")
-
-    bill_txt = "\n".join([ln for ln in bill_lines if ln])
+    # ---- Bill To (fixed) ----
+    bill_txt = _bill_to_text(cfg)
 
     # ---- Ship To ----
     ship_lines: List[str] = []
     arow = pd.Series(dtype="object")
     if not adr.empty:
         comp_col = _pick_first_col(adr, ["Company","Location","Site","Name"]) or "Company"
-        sub = adr[adr[comp_col].astype(str) == str(company)]
+        sub = adr[adr[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()]
         arow = sub.iloc[0] if not sub.empty else adr.iloc[0]
 
     ship_lines.append(remove_prefix_for_display(company))
 
-    # Address line 1 / 2
-    for key in ["Address","Address 1","Address1","Street","Line1"]:
-        if key in arow.index and str(arow.get(key, "")).strip():
-            ship_lines.append(str(arow.get(key)).strip()); break
-    for key in ["Address 2","Address2","Line2","Street 2"]:
-        if key in arow.index and str(arow.get(key, "")).strip():
-            ship_lines.append(str(arow.get(key)).strip()); break
+    # Address line 1 / 2 (handle common variants)
+    addr1_key = _pick_first_col(pd.DataFrame([arow]), ["Address","Address 1","Address1","Street","Line1"]) or ""
+    addr2_key = _pick_first_col(pd.DataFrame([arow]), ["Address 2","Address2","Line2","Street 2"]) or ""
+    if addr1_key and str(arow.get(addr1_key, "")).strip():
+        ship_lines.append(str(arow.get(addr1_key)).strip())
+    if addr2_key and str(arow.get(addr2_key, "")).strip():
+        ship_lines.append(str(arow.get(addr2_key)).strip())
 
     # City/State/Zip
     city  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")).strip()
     state = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")).strip()
-    zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code"]) or "", "")).strip()
+    zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code","Zip Code"]) or "", "")).strip()
     if city or state or zipc:
         if city and (state or zipc):
             ship_lines.append(f"{city}, {_join_nonempty(state, zipc, sep=' ')}".strip(", "))
@@ -474,19 +432,20 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
             ship_lines.append(_join_nonempty(city, state, zipc, sep=" "))
 
     # User contact by Company + Username
-    c_name, c_email, c_phone = _match_user_contact(user_df, company, username)
+    c_name, c_email, c_phone = _match_user_contact(user_df, company, username, fallback_name=fallback_contact)
     if c_name:  ship_lines.append(c_name)
     if c_email: ship_lines.append(c_email)
-    if c_phone: ship_lines.append(f"Phone: {c_phone}")
+    if c_phone:
+        # avoid "Phone: Phone:"
+        c_phone = re.sub(r'^\s*Phone:\s*', '', c_phone, flags=re.I)
+        ship_lines.append(f"Phone: {c_phone}")
 
     ship_txt = "\n".join([ln for ln in ship_lines if ln])
     return ship_txt, bill_txt
 
 # ---------- Word helpers ----------
 def _remove_table_borders(table) -> None:
-    """
-    Remove all borders from a python-docx table (safe, no AttributeError).
-    """
+    """Remove all borders from a python-docx table (safe)."""
     tbl = table._tbl
     tblPr = tbl.tblPr or tbl.get_or_add_tblPr()
     # Replace existing borders with 'no borders'
@@ -511,8 +470,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
       - Header with Company (prefix removed), title, date, quote#
       - Vendor
       - Side-by-side Ship To (left) and Bill To (right) with NO borders
-      - Lines table: Part Number, Description, Quantity, Price/Unit, Total
-        (narrow QTY/Price/Total columns)
+      - Lines table: Part Number, Description, Qty, Price, Total (display labels)
     """
     doc = Document()
     doc.styles['Normal'].font.name = 'Calibri'
@@ -535,7 +493,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     # Vendor
     doc.add_paragraph("")
     vr = doc.add_paragraph(); vr.add_run("Vendor").bold = True
-    doc.add_paragraph(vendor_text if vendor_text.strip() else "_____________________________")
+    doc.add_paragraph(vendor_text if str(vendor_text).strip() else "_____________________________")
 
     # Addresses table (2x2): header row + values row
     doc.add_paragraph("")
@@ -546,30 +504,36 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     vals = tbl_addr.rows[1].cells
     vals[0].text = ship_to_text
     vals[1].text = bill_to_text
-
-    # No borders around addresses, per request
     _remove_table_borders(tbl_addr)
 
     # Lines
     doc.add_paragraph("")
-    cols = ["Part Number","Description","Quantity","Price/Unit","Total"]
+    # Display labels per spec (but storage remains Quantity/Price/Unit)
+    display_cols = ["Part Number","Description","Qty","Price","Total"]
     lines = _coerce_lines_for_storage(lines_df).copy()
-    BLANK_ROWS = max(10, 30 - len(lines))
+    # Map storage -> display
+    display_df = pd.DataFrame({
+        "Part Number": lines["Part Number"],
+        "Description": lines["Description"],
+        "Qty":         lines["Quantity"],
+        "Price":       lines["Price/Unit"],
+        "Total":       lines["Total"],
+    })
+    BLANK_ROWS = max(10, 30 - len(display_df))
     if BLANK_ROWS > 0:
-        lines = pd.concat([lines, pd.DataFrame([dict(zip(cols, [""]*5)) for _ in range(BLANK_ROWS)])], ignore_index=True)
+        display_df = pd.concat([display_df, pd.DataFrame([dict(zip(display_cols, [""]*5)) for _ in range(BLANK_ROWS)])], ignore_index=True)
 
-    tbl = doc.add_table(rows=1 + len(lines), cols=len(cols))
+    tbl = doc.add_table(rows=1 + len(display_df), cols=len(display_cols))
     tbl.style = 'Table Grid'
-    # Set widths: PN ~ 1.7", Desc ~ 3.6", Qty ~ 0.9", Price ~ 1.2", Total ~ 1.2"
     widths = [Inches(1.7), Inches(3.6), Inches(0.9), Inches(1.2), Inches(1.2)]
-    for j in range(len(cols)):
+    for j in range(len(display_cols)):
         for r in tbl.rows:
             r.cells[j].width = widths[j]
 
-    for j,c in enumerate(cols):
+    for j,c in enumerate(display_cols):
         tbl.cell(0,j).text = c
-    for i,(_,r) in enumerate(lines.iterrows(), start=1):
-        for j,c in enumerate(cols):
+    for i,(_,r) in enumerate(display_df.iterrows(), start=1):
+        for j,c in enumerate(display_cols):
             tbl.cell(i,j).text = str("" if pd.isna(r[c]) else r[c])
 
     doc.add_paragraph("")
@@ -607,8 +571,8 @@ def label_for_source(engine: str, path: Optional[str]) -> str:
 
 # ---------- App ----------
 cfg = load_config(); cfg = to_plain(cfg)
-
 cookie_cfg = cfg.get('cookie', {})
+
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
     cookie_cfg.get('name', 'spf_po_portal_v3'),
@@ -733,7 +697,22 @@ else:
             sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], [Name]"
             df = q(sql, tuple(params))
 
-        df = strip_time(df, DATE_COLS.get(src, [])); df = attach_row_key(df)
+        df = strip_time(df, DATE_COLS.get(src, []))
+
+        # Add key + qty column
+        def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
+            df_in = df_in.copy()
+            key_col = next((c for c in ["ID","id","Purchase Order ID","Row ID","RowID"] if c in df_in.columns), None)
+            if key_col:
+                df_in["__KEY__"] = df_in[key_col].astype(str); return df_in
+            cols = [c for c in ["Part Number","Part Numbers","Part #","Part No","PN","Name","Line Name","Description",
+                                "Vendor","Vendors","Company","Created On"] if c in df_in.columns]
+            if not cols: cols = list(df_in.columns)
+            s = df_in[cols].astype(str).agg("|".join, axis=1)
+            df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+            return df_in
+
+        df = attach_row_key(df)
         hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__","__QTY__"}
         cols_for_download = [c for c in df.columns if (c not in hide_set)]
 
@@ -754,7 +733,6 @@ else:
 
         with st.form(f"{grid_key}_form", clear_on_submit=False):
             edited = st.data_editor(df_display, use_container_width=True, hide_index=True, column_config=grid_col_cfg, key=grid_key)
-            # small buttons via narrow columns
             c_sp1, c_add, c_clear_sel, _ = st.columns([6,1,1,6])
             add_clicked = c_add.form_submit_button("🛒 Add", use_container_width=True)
             clear_sel_clicked = c_clear_sel.form_submit_button("🧹 Clear", use_container_width=True)
@@ -815,7 +793,8 @@ else:
         if cart_df.empty:
             cart_df = pd.DataFrame(columns=list(df.columns)+["__QTY__"]); st.session_state[cart_key] = cart_df
         else:
-            if "__KEY__" not in cart_df.columns: cart_df = attach_row_key(cart_df)
+            if "__KEY__" not in cart_df.columns: 
+                cart_df["__KEY__"] = cart_df.astype(str).agg("|".join, axis=1).apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
             if "__QTY__" not in cart_df.columns: cart_df["__QTY__"] = ""
             st.session_state[cart_key] = cart_df
 
@@ -845,17 +824,16 @@ else:
         with st.form(f"{cart_editor_key}_form", clear_on_submit=False):
             edited_cart = st.data_editor(cart_display, use_container_width=True, hide_index=True,
                                          column_config=cart_col_cfg, key=cart_editor_key)
-            # Buttons row: Remove (left small) | Clear, Save, Generate, Email (right small)
+            # Buttons row: Remove (left small) | Clear, Save, Generate (right small)
             left, right = st.columns([6,4])
             with left:
                 rcol, _ = st.columns([1,7])
                 remove_btn = rcol.form_submit_button("🗑️ Remove", use_container_width=True)
             with right:
-                c_clear, c_save, c_gen, c_email = st.columns([1,1,1,1])
+                c_clear, c_save, c_gen = st.columns([1,1,1])
                 clear_cart_btn = c_clear.form_submit_button("🧼 Clear", use_container_width=True, disabled=cart_df.empty)
                 save_qty = c_save.form_submit_button("💾 Save", use_container_width=True)
                 gen_clicked = c_gen.form_submit_button("🧾 Generate", use_container_width=True)
-                _ = c_email.form_submit_button("✉️ Email", use_container_width=True, disabled=True)
 
         if save_qty and "Qty" in edited_cart.columns:
             def norm_q(v):
@@ -904,7 +882,7 @@ else:
                 })
 
                 company_for_save = chosen if chosen != ADMIN_ALL else "All companies (admin)"
-                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username))
+                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact=str(name))
 
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote(
@@ -932,7 +910,7 @@ else:
                 st.download_button(
                     "Download Quote (Word)",
                     data=doc_bytes,
-                    file_name=f"{qnum}_{sanitize_filename(company_for_save)}.docx",
+                    file_name=f"{qnum}_{re.sub(r'[^A-Za-z0-9._ -]+', '_', str(company_for_save or '')).strip()[:80] or 'Quote'}.docx",
                     mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
 
@@ -968,10 +946,10 @@ else:
             where_sql = " AND ".join(where)
             sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
             df = q(sql, tuple(params))
-        df = strip_time(df, DATE_COLS.get(src, [])); df = attach_row_key(df)
-        hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__","__QTY__"}
-        cols_for_download = [c for c in table_columns_in_order(None, src) if (c in df.columns) and (c not in hide_set)]
-        display_cols = [c for c in cols_for_download if c != "Company"]
+        df = strip_time(df, DATE_COLS.get(src, []))
+        # Hide noisy columns
+        hide_set = set(HIDE_COLS.get(src, []))
+        display_cols = [c for c in df.columns if c not in hide_set and c != "Company"]
         st.markdown(f"### Outstanding POs — {title_companies}")
         st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
         c1, _, _ = st.columns([1,1,6])
@@ -997,7 +975,6 @@ else:
 
         # NEW QUOTE
         with tab_new:
-            # Let user choose Location (Company) for this new quote
             try_default_idx = company_options.index(chosen) if chosen in company_options else 0
             company_new = st.selectbox("Location", options=company_options, index=try_default_idx)
             # Choose vendor
@@ -1011,7 +988,7 @@ else:
             quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no, help="QR-YYYY-####")
 
             # Prefill addresses from DB for selected company
-            ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_new, str(username))
+            ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_new, str(username), cfg, fallback_contact=str(name))
             c1, c2 = st.columns(2)
             with c1:
                 ship_to = st.text_area("Ship To Address", value=ship_to, height=120)
@@ -1034,7 +1011,7 @@ else:
                 }
             )
 
-            c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
+            c_left, c_sp, c_save, c_gen = st.columns([5,5,1,1])
             with c_save:
                 if st.button("Save", use_container_width=True):
                     qid, qnum = save_quote(ACTIVE_DB_PATH,
@@ -1062,14 +1039,11 @@ else:
                         lines_df=edited_new
                     )
                     st.download_button("Download Quote (Word)", data=doc_bytes,
-                                       file_name=f"{qnum}_{sanitize_filename(company_new)}.docx",
+                                       file_name=f"{qnum}_{re.sub(r'[^A-Za-z0-9._ -]+', '_', str(company_new or '')).strip()[:80] or 'Quote'}.docx",
                                        mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-            with c_email:
-                st.button("Email", use_container_width=True, disabled=True)
 
         # BROWSE / EDIT
         with tab_browse:
-            # Filter by company (keeps DB prefix names)
             comp_filter = st.selectbox("Filter by Company", options=["(all)"] + company_options, index=0)
             dfq = list_quotes(ACTIVE_DB_PATH,
                               company=(None if comp_filter=="(all)" else comp_filter),
@@ -1107,7 +1081,7 @@ else:
                         }
                     )
 
-                    c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
+                    c_left, c_sp, c_save, c_gen = st.columns([5,5,1,1])
                     with c_save:
                         if st.button("Save", key=f"save_quote_{rec['id']}", use_container_width=True):
                             save_quote(ACTIVE_DB_PATH, quote_number=quote_no or None,
@@ -1132,15 +1106,24 @@ else:
                                 lines_df=edited_exist
                             )
                             st.download_button("Download Quote (Word)", data=doc_bytes,
-                                               file_name=f"{qnum2}_{sanitize_filename(rec['company'])}.docx",
+                                               file_name=f"{qnum2}_{re.sub(r'[^A-Za-z0-9._ -]+', '_', str(rec['company'] or '')).strip()[:80] or 'Quote'}.docx",
                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                                key=f"gen_dl_{rec['id']}")
-                    with c_email:
-                        st.button("Email", use_container_width=True, disabled=True)
 
-    # ---------- Config template (admins only) ----------
-    if is_admin:
-        with st.expander('ℹ️ Config template'):
-            st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+# ---- Excel simple export ----
+def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
+    import xlsxwriter, io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
+        df.to_excel(w, index=False, sheet_name=sheet)
+        ws = w.sheets[sheet]
+        ws.autofilter(0,0,max(0,len(df)), max(0,len(df.columns)-1))
+        for i,_ in enumerate(df.columns):
+            try:
+                width = 16 if df.empty else min(60, max(12, int(df.iloc[:,i].astype(str).str.len().quantile(0.9))+2))
+                ws.set_column(i,i,width)
+            except Exception:
+                pass
+    return buf.getvalue()
 
 
