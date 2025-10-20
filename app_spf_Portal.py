@@ -654,7 +654,13 @@ else:
         matches = {db_map[n] for n in allowed_norm if n in db_map}
         allowed_set = matches if matches else set(allowed_cfg)
     if not allowed_set:
-        st.error("No companies configured for your account. Ask an admin to update your access.")
+        env_allow_all = str(os.environ.get('SPF_ALLOW_ALL','0')).lower() in {'1','true','yes','on'}
+        if is_admin or env_allow_all:
+            allowed_set = set(all_companies)
+        else:
+            st.error("No companies configured for your account. Ask an admin to update your access.")
+            with st.expander("Company values present in data"): st.write(sorted(all_companies))
+            st.stop()
         with st.expander("Company values present in data"): st.write(sorted(all_companies))
         st.stop()
 
