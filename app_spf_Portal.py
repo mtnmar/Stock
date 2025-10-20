@@ -359,6 +359,25 @@ def _load_table(db_path: str, name: str) -> pd.DataFrame:
             return pd.read_sql_query(f"SELECT * FROM [{name}]", conn)
     except Exception:
         return pd.DataFrame()
+def companies_from_anywhere(db_path: str, existing: list[str]) -> list[str]:
+    """Fallback source of company names.
+    1) If existing list is non-empty, return it.
+    2) Else try 'addresses' table distinct Company/Location/Site/Name.
+    """
+    if existing:
+        return existing
+    adr = _load_table(db_path, "addresses")
+    if not adr.empty:
+        key = None
+        for cand in ["Company","Location","Site","Name"]:
+            if cand in adr.columns:
+                key = cand; break
+        if key:
+            vals = adr[key].dropna().astype(str).str.strip()
+            out = sorted(v for v in vals.unique().tolist() if v)
+            return out
+    return []
+
 
 def _user_table(db_path: str) -> Tuple[pd.DataFrame, str]:
     for nm in ["user_data", "User_Data", "user_contacts"]:
@@ -637,6 +656,7 @@ else:
             return None, cols_in_db, all_companies, None
 
     _, cols_any, all_companies, _ = load_src("restock")
+    all_companies = companies_from_anywhere(ACTIVE_DB_PATH, all_companies)
     username_ci = str(username).casefold()
     admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
     is_admin = username_ci in admin_users_ci
@@ -669,10 +689,16 @@ else:
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1: select_options += [ADMIN_ALL]
     select_options += company_options
-    chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=0)
+    default_index = 0
+    if is_admin and company_options:
+        default_index = 2 if (is_admin and len(all_companies) > 1) else 1
+    chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=min(default_index, len(select_options)-1))
     if chosen == "— Choose company —":
-        st.info("Select your Company on the left to load data."); st.stop()
-    if is_admin and chosen == ADMIN_ALL:
+        if is_admin and all_companies:
+            chosen_companies = sorted(all_companies); title_companies = "All companies (admin)"
+        else:
+            st.info("Select your Company on the left to load data."); st.stop()
+    elif is_admin and chosen == ADMIN_ALL:
         chosen_companies = sorted(all_companies); title_companies = "All companies (admin)"
     else:
         chosen_companies = [chosen]; title_companies = chosen
@@ -718,7 +744,11 @@ else:
                 vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
                 label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
                 search = st.sidebar.text_input(label)
-                ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
+                where = []; params = []
+                if chosen_companies:
+                    ph = ','.join(['?']*len(chosen_companies))
+                    where.append(f"[Company] IN ({ph})")
+                    params += list(chosen_companies)
                 if search:
                     if vendor_col:
                         where.append(f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)")
@@ -726,7 +756,7 @@ else:
                     else:
                         where.append("([Part Numbers] LIKE ? OR [Name] LIKE ?)")
                         params += [f"%{search}%"]*2
-                where_sql = " AND ".join(where)
+                where_sql = " AND ".join(where) if where else "1=1"
                 sql = f"SELECT * FROM [{tbl}] WHERE {where_sql} ORDER BY [Company], [Name]"
                 df = q(sql, tuple(params))
 
@@ -981,11 +1011,15 @@ else:
                 st.warning("No SQLite table found for Outstanding POs (expected a table like 'po_outstanding'). Showing empty view.")
                 df = pd.DataFrame()
             else:
-                ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
+                where = []; params = []
+                if chosen_companies:
+                    ph = ','.join(['?']*len(chosen_companies))
+                    where.append(f"[Company] IN ({ph})")
+                    params += list(chosen_companies)
                 if search:
                     where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
                     params += [f"%{search}%"]*4
-                where_sql = " AND ".join(where)
+                where_sql = " AND ".join(where) if where else "1=1"
                 sql = f"SELECT * FROM [{tbl}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
                 df = q(sql, tuple(params))
         df = strip_time(df, DATE_COLS.get(src, []))
