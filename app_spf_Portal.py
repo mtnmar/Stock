@@ -1092,7 +1092,7 @@ else:
                 use_username = chosen_user or str(username)
             else:
                 st.stop()
-                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact="")
+                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, st.session_state.get('contact_user_override', str(username)))
 
                 # Debug: show which contact row we matched for this username
                 _udf, _ = _user_table(ACTIVE_DB_PATH)
