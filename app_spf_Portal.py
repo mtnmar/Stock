@@ -1031,6 +1031,8 @@ else:
                 _udf, _ = _user_table(ACTIVE_DB_PATH)
                 _cname, _cemail, _cphone = _match_user_contact(_udf, company_for_save, str(username))
                 st.caption(f"Matched contact for username '{username}': {_cname or '(none)'} | {_cemail or '(no email)'} | {('Phone: '+_cphone) if _cphone else '(no phone)'}")
+                udf_src, udf_name = _user_table(ACTIVE_DB_PATH)
+                st.caption('Contact source table: ' + str(udf_name))
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote(
                     ACTIVE_DB_PATH,
@@ -1146,8 +1148,7 @@ else:
             if "new_quote_no" not in st.session_state:
                 st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
             quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no, help="QR-YYYY-####")
-
-            ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_new, str(username), cfg, fallback_contact=str(name))
+            ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_new, str(username))
             c1, c2 = st.columns(2)
             with c1:
                 ship_to = st.text_area("Ship To Address", value=ship_to, height=120)
