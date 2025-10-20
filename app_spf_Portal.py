@@ -379,45 +379,40 @@ def remove_prefix_for_display(company: str) -> str:
 
 def _match_user_contact(df: pd.DataFrame, company: str, username: str) -> Tuple[str,str,str]:
     """
-    Return (Contact, Email, Phone) matched by Company and Username (case-insensitive).
+    Return (Contact, Email, Phone). Prefer exact username match; do NOT fall back to random rows.
+    If no username match, return blanks.
     """
     if df.empty:
         return ("", "", "")
 
-    comp_col    = _pick_first_col(df, ["Company","Location","Site","Name"]) or "Company"
     user_col    = _pick_first_col(df, ["Username","User","Login","Email","UserName"])
     contact_col = _pick_first_col(df, ["Contact","Name"]) or "Contact"
     email_col   = _pick_first_col(df, ["Email"]) or "Email"
     phone_col   = _pick_first_col(df, ["Phone","Telephone","Cell"]) or "Phone"
 
-    view = df.copy()
-
-    # narrow by company
-    if comp_col in view.columns:
-        mask_company = view[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
-        narrowed = view[mask_company]
-        if not narrowed.empty:
-            view = narrowed
-
-    # narrow by username
-    if user_col and (user_col in view.columns):
-        mask_user = view[user_col].astype(str).str.strip().str.casefold() == str(username).strip().casefold()
-        narrowed_user = view[mask_user]
+    if user_col and (user_col in df.columns):
+        mask_user = df[user_col].astype(str).str.strip().str.casefold() == str(username).strip().casefold()
+        narrowed_user = df[mask_user]
         if not narrowed_user.empty:
-            view = narrowed_user
-
-    row = view.iloc[0] if not view.empty else df.iloc[0]
-    return (
-        str(row.get(contact_col, "") or "").strip(),
-        str(row.get(email_col, "") or "").strip(),
-        str(row.get(phone_col, "") or "").strip(),
-    )
+            row = narrowed_user.iloc[0]
+            return (
+                str(row.get(contact_col, "") or "").strip(),
+                str(row.get(email_col, "") or "").strip(),
+                str(row.get(phone_col, "") or "").strip(),
+            )
+    # No match: return blanks instead of first row to avoid wrong contact
+    return ("", "", "")
 
 def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[str, str]:
     """
-    Ship To (for DOC ONLY): Company (prefix removed), Address(1/2), City/State Zip,
-    then user Contact/Email/Phone from User_Data.
-    Bill To: 'Billing' (semicolon→lines) + Billing Contact/Email/Phone.
+    Ship To (for DOC ONLY):
+      - Company: prefer addresses.Company (clean, no numeric prefix). Else fallback to prefix-stripped 'company' arg.
+      - Address lines: addresses.Address (+ Address 2 if present)
+      - City/State/Zip: use combined column if present (e.g., 'City,Sate,Zip', 'City,State,Zip', 'City_State_Zip');
+        otherwise compose from City + State/ST + Zip/Postal.
+      - Then append user contact (from user_contacts/User_Data) matched by username (if found).
+    Bill To:
+      - addresses.Billing (semicolon → lines) + BillingContact, BillingEmail, BillingPhone (if present).
     """
     adr = _load_table(db_path, "addresses")
     user_df, _ = _user_table(db_path)
@@ -425,17 +420,13 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
     # ---- Bill To ----
     bill_lines: List[str] = []
     if not adr.empty:
-        # Use first nonempty Billing field as the multi-line body
         if "Billing" in adr.columns:
-            billing_text = ""
-            # prefer a row with Billing filled; else any row
             rows_with = adr[adr["Billing"].astype(str).str.strip() != ""]
             row_b = rows_with.iloc[0] if not rows_with.empty else adr.iloc[0]
             billing_text = str(row_b.get("Billing","")).strip()
             if billing_text:
                 bill_lines.extend(_split_semicolon_lines(billing_text))
 
-            # append contact/email/phone if present (optional)
             b_contact = str(row_b.get(_pick_first_col(adr, ["Billing Contact","BillingContact"]) or "", "")).strip()
             b_email   = str(row_b.get(_pick_first_col(adr, ["BillingEmail","Billing Email"]) or "", "")).strip()
             b_phone   = str(row_b.get(_pick_first_col(adr, ["BillingPhone","Billing Phone"]) or "", "")).strip()
@@ -443,17 +434,37 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
             if b_email:   bill_lines.append(b_email)
             if b_phone:   bill_lines.append(f"Phone: {b_phone}")
 
-    bill_txt = "\n".join([ln for ln in bill_lines if ln])
+    bill_txt = "
+".join([ln for ln in bill_lines if ln])
 
     # ---- Ship To ----
     ship_lines: List[str] = []
     arow = pd.Series(dtype="object")
-    if not adr.empty:
-        comp_col = _pick_first_col(adr, ["Company","Location","Site","Name"]) or "Company"
-        sub = adr[adr[comp_col].astype(str) == str(company)]
-        arow = sub.iloc[0] if not sub.empty else adr.iloc[0]
+    printed_company = remove_prefix_for_display(company)
 
-    ship_lines.append(remove_prefix_for_display(company))
+    if not adr.empty:
+        # Prefer matching by Location (since RE-STOCK 'Company' values are like '110 - Deckers Creek Limestone')
+        loc_col = _pick_first_col(adr, ["Location"])
+        comp_col = _pick_first_col(adr, ["Company"])
+        # 1) Try exact Location match to the chosen string
+        if loc_col and loc_col in adr.columns:
+            mloc = adr[loc_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
+            if mloc.any():
+                arow = adr[mloc].iloc[0]
+        # 2) Else try Company match to prefix-stripped label
+        if arow.empty and comp_col and comp_col in adr.columns:
+            mcomp = adr[comp_col].astype(str).str.strip().str.casefold() == remove_prefix_for_display(company).strip().casefold()
+            if mcomp.any():
+                arow = adr[mcomp].iloc[0]
+        # set printed company from addresses.Company if we have it
+        if comp_col and comp_col in adr.columns and not arow.empty:
+            printed_company = str(arow.get(comp_col, printed_company) or printed_company)
+
+        if arow.empty:
+            arow = adr.iloc[0]  # final fallback (should be rare)
+
+    # Company name on first line (clean)
+    ship_lines.append(str(printed_company).strip())
 
     # Address line 1 / 2
     for key in ["Address","Address 1","Address1","Street","Line1"]:
@@ -463,23 +474,33 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
         if key in arow.index and str(arow.get(key, "")).strip():
             ship_lines.append(str(arow.get(key)).strip()); break
 
-    # City/State/Zip
-    city  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")).strip()
-    state = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")).strip()
-    zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code"]) or "", "")).strip()
-    if city or state or zipc:
-        if city and (state or zipc):
-            ship_lines.append(f"{city}, {_join_nonempty(state, zipc, sep=' ')}".strip(", "))
-        else:
-            ship_lines.append(_join_nonempty(city, state, zipc, sep=" "))
+    # City/State/Zip — support combined column used in your sheet ("City,Sate,Zip")
+    combined_candidates = ["City,Sate,Zip","City,State,Zip","City_State_Zip","City State Zip","City, ST Zip"]
+    combined_key = None
+    for cand in combined_candidates:
+        if cand in arow.index and str(arow.get(cand, "")).strip():
+            combined_key = cand; break
 
-    # User contact by Company + Username
-    c_name, c_email, c_phone = _match_user_contact(user_df, company, username)
+    if combined_key:
+        ship_lines.append(str(arow.get(combined_key)).strip())
+    else:
+        city  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")).strip()
+        state = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")).strip()
+        zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code"]) or "", "")).strip()
+        if city or state or zipc:
+            if city and (state or zipc):
+                ship_lines.append(f"{city}, {_join_nonempty(state, zipc, sep=' ')}".strip(", "))
+            else:
+                ship_lines.append(_join_nonempty(city, state, zipc, sep=" "))
+
+    # User contact by Username (no random fallback)
+    c_name, c_email, c_phone = _match_user_contact(user_df, printed_company, username)
     if c_name:  ship_lines.append(c_name)
     if c_email: ship_lines.append(c_email)
     if c_phone: ship_lines.append(f"Phone: {c_phone}")
 
-    ship_txt = "\n".join([ln for ln in ship_lines if ln])
+    ship_txt = "
+".join([ln for ln in ship_lines if ln])
     return ship_txt, bill_txt
 
 # ---------- Word helpers ----------
