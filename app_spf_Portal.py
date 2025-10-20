@@ -432,6 +432,67 @@ def _bill_to_text(cfg: dict) -> str:
         cleaned.append(s)
     return "\n".join(cleaned)
 
+
+# ---------- UI helper: user picker dialog ----------
+def _user_picker_dialog(key_prefix: str, db_path: str, default_username: str) -> Optional[str]:
+    """
+    Show a modal dialog to choose which user to use for contact in the Ship To block.
+    Returns the chosen username (string) or None if canceled.
+    """
+    try:
+        from streamlit import dialog as _st_dialog  # st.dialog available in Streamlit >= 1.25
+    except Exception:
+        _st_dialog = None
+
+    df_users, tbl_name = _user_table(db_path)
+    if df_users.empty:
+        return default_username
+
+    user_col = _pick_first_col(df_users, ["UserName","Username","User","Login","Email","User Name"]) or "UserName"
+    options = sorted(df_users[user_col].dropna().astype(str).unique().tolist())
+    if not options:
+        return default_username
+
+    chosen_key = f"{key_prefix}_chosen_username"
+    show_key   = f"{key_prefix}_show_dialog"
+
+    if show_key not in st.session_state:
+        st.session_state[show_key] = False
+
+    def _render_body():
+        # Default index tries to use the logged-in username
+        try:
+            idx = options.index(str(default_username)) if str(default_username) in options else 0
+        except ValueError:
+            idx = 0
+        st.write("Select the requestor to print under **Ship To**:")
+        choice = st.selectbox("User", options=options, index=idx, key=f"{key_prefix}_select_user")
+        c1, c2 = st.columns(2)
+        if c1.button("Use this user", key=f"{key_prefix}_confirm"):
+            st.session_state[chosen_key] = choice
+            st.session_state[show_key] = False
+            st.session_state[f"{key_prefix}_proceed"] = True
+            st.rerun()
+        if c2.button("Cancel", key=f"{key_prefix}_cancel"):
+            st.session_state[chosen_key] = None
+            st.session_state[show_key] = False
+            st.session_state[f"{key_prefix}_proceed"] = False
+            st.rerun()
+
+    # Prefer a real modal dialog if available
+    if _st_dialog:
+        if st.session_state.get(show_key, False):
+            @st.dialog("Choose requestor")
+            def _dlg():
+                _render_body()
+            _dlg()
+    else:
+        # Fallback: popover-like inline section
+        if st.session_state.get(show_key, False):
+            with st.expander("Choose requestor"):
+                _render_body()
+
+    return st.session_state.get(chosen_key, None)
 def build_ship_bill_blocks(db_path: str, company: str, username: str, cfg: dict, fallback_contact: str="") -> Tuple[str, str]:
     """
     Ship To sourcing (DOC ONLY):
@@ -1025,6 +1086,12 @@ else:
                         st.stop()
                 if not company_for_save:
                     company_for_save = title_companies if title_companies else '(unknown)'
+            # Present modal dialog to choose requestor
+            chosen_user = _user_picker_dialog('restock_pick', ACTIVE_DB_PATH, str(username))
+            if st.session_state.get('restock_pick_proceed'):
+                use_username = chosen_user or str(username)
+            else:
+                st.stop()
                 ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact="")
 
                 # Debug: show which contact row we matched for this username
@@ -1063,7 +1130,6 @@ else:
                     file_name=f"{qnum}_{safe_name}.docx",
                     mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
-
     # ----------------- Outstanding POs -----------------
     elif page == "Outstanding POs":
         src = "po_outstanding"
