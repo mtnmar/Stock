@@ -36,7 +36,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-BOTTOM-RIGHT-DL"
+APP_VERSION = "2025.10.20-BOTTOM-RIGHT-DL-v2"
 
 # ---- deps ----
 try:
@@ -390,9 +390,6 @@ def remove_prefix_for_display(company: str) -> str:
     return re.sub(r'^\s*\d+\s*-\s*', '', str(company or "")).strip()
 
 def _match_user_contact(df: pd.DataFrame, company: str, username: str) -> Tuple[str,str,str]:
-    """
-    STRICT username-only contact lookup. Returns blanks if not found.
-    """
     if df.empty or not str(username).strip():
         return ("", "", "")
     user_col    = _pick_first_col(df, ["UserName","Username","User","Login","Email","User Name"])
@@ -1140,9 +1137,9 @@ else:
             with c_email:
                 st.button("Email", use_container_width=True, disabled=True, key="btn_new_email")
 
-            # ---------- Bottom-right download button ----------
-            br_l, br_m, br_r = st.columns([6,3,2])
-            with br_r:
+            # ---------- Bottom-right download button (true right align) ----------
+            spacer_col, right_col = st.columns([12, 1])  # big spacer + small right rail
+            with right_col:
                 doc = st.session_state.get("new_quote_doc")
                 if doc:
                     st.download_button(
@@ -1150,7 +1147,8 @@ else:
                         data=doc["bytes"],
                         file_name=doc["name"],
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="dl_quote_word_new_bottom"
+                        key="dl_quote_word_new_bottom",
+                        use_container_width=True
                     )
 
         # ===== BROWSE / EDIT =====
@@ -1185,7 +1183,6 @@ else:
                         bill_to = st.text_area("Bill To Address", value=rec["bill_to"] or "", height=120,
                                                key=f"browse_bill_to_{rec['id']}")
 
-                    # Maintain an editable DataFrame in session state per quote
                     lines_state_key = f"edit_lines_df_{rec['id']}"
                     if lines_state_key not in st.session_state:
                         st.session_state[lines_state_key] = rec["lines"].copy()
@@ -1205,7 +1202,6 @@ else:
                     )
                     st.session_state[lines_state_key] = edited_exist
 
-                    # Quick-add helpers
                     ca1, ca2, ca3, _ = st.columns([1,1,1,6])
                     if ca1.button("➕ Blank row", key=f"btn_add_blank_{rec['id']}"):
                         add_row = {"Part Number":"", "Description":"", "Quantity":"", "Price/Unit":"", "Total":""}
