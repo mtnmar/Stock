@@ -625,9 +625,14 @@ else:
             all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
             return df_all, cols_in_db, all_companies, pq_path
         else:
-            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1")
+            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
+            if not tbl:
+                all_companies = []
+                cols_in_db = []
+                return None, cols_in_db, all_companies, None
+            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{tbl}] WHERE [Company] IS NOT NULL ORDER BY 1")
             all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
-            cols_in_db = table_columns_in_order(None, src)
+            cols_in_db = table_columns_in_order(None, tbl)
             return None, cols_in_db, all_companies, None
 
     _, cols_any, all_companies, _ = load_src("restock")
@@ -691,21 +696,26 @@ else:
             order_cols = [c for c in ["Company","Name"] if c in df.columns]
             df = df.sort_values(order_cols) if order_cols else df
         else:
-            cols_in_db = table_columns_in_order(None, src)
-            vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
-            label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
-            search = st.sidebar.text_input(label)
-            ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
-            if search:
-                if vendor_col:
-                    where.append(f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)")
-                    params += [f"%{search}%"]*3
-                else:
-                    where.append("([Part Numbers] LIKE ? OR [Name] LIKE ?)")
-                    params += [f"%{search}%"]*2
-            where_sql = " AND ".join(where)
-            sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], [Name]"
-            df = q(sql, tuple(params))
+            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
+            if not tbl:
+                st.warning("No SQLite table found for RE-STOCK (expected a table like 'restock'). Showing empty view.")
+                df = pd.DataFrame()
+            else:
+                cols_in_db = table_columns_in_order(None, tbl)
+                vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
+                label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
+                search = st.sidebar.text_input(label)
+                ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
+                if search:
+                    if vendor_col:
+                        where.append(f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)")
+                        params += [f"%{search}%"]*3
+                    else:
+                        where.append("([Part Numbers] LIKE ? OR [Name] LIKE ?)")
+                        params += [f"%{search}%"]*2
+                where_sql = " AND ".join(where)
+                sql = f"SELECT * FROM [{tbl}] WHERE {where_sql} ORDER BY [Company], [Name]"
+                df = q(sql, tuple(params))
 
         df = strip_time(df, DATE_COLS.get(src, []))
 
@@ -948,14 +958,19 @@ else:
                 else:
                     df = df.assign(_co=co).sort_values(["_co"]).drop(columns=["_co"])
         else:
+            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
             search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
-            ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
-            if search:
-                where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
-                params += [f"%{search}%"]*4
-            where_sql = " AND ".join(where)
-            sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
-            df = q(sql, tuple(params))
+            if not tbl:
+                st.warning("No SQLite table found for Outstanding POs (expected a table like 'po_outstanding'). Showing empty view.")
+                df = pd.DataFrame()
+            else:
+                ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
+                if search:
+                    where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
+                    params += [f"%{search}%"]*4
+                where_sql = " AND ".join(where)
+                sql = f"SELECT * FROM [{tbl}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
+                df = q(sql, tuple(params))
         df = strip_time(df, DATE_COLS.get(src, []))
         # Hide noisy columns
         hide_set = set(HIDE_COLS.get(src, []))
@@ -1135,5 +1150,58 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
             except Exception:
                 pass
     return buf.getvalue()
+
+
+
+@st.cache_data(show_spinner=False)
+def list_sqlite_tables(db_path: str) -> list[str]:
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+def resolve_sql_table(logical: str, db_path: str) -> str | None:
+    """
+    Map logical names ('restock', 'po_outstanding') to actual SQLite table names.
+    Priority:
+      1) Explicit env override
+      2) Exact match (case-insensitive)
+      3) Fuzzy contains (e.g., 'restock' in table name)
+    """
+    env_map = {
+        "restock": os.environ.get("SPF_SQL_TABLE_RESTOCK"),
+        "po_outstanding": os.environ.get("SPF_SQL_TABLE_PO_OUT"),
+    }
+    if logical in env_map and env_map[logical]:
+        return env_map[logical]
+
+    tables = list_sqlite_tables(db_path)
+    if not tables:
+        return None
+
+    # Exact (case-insensitive)
+    low_map = {t.lower(): t for t in tables}
+    if logical.lower() in low_map:
+        return low_map[logical.lower()]
+
+    # Fuzzy contains (handle common variants)
+    want = logical.replace("_", "").lower()
+    def norm(s): return s.replace("_", "").replace(" ", "").lower()
+    cands = [t for t in tables if want in norm(t)]
+    if cands:
+        cands.sort(key=len)  # prefer shortest
+        return cands[0]
+
+    # Last resort: first table with a 'Company' column
+    for t in tables:
+        try:
+            cols = table_columns_in_order(db_path, t)
+            if "Company" in cols:
+                return t
+        except Exception:
+            pass
+    return None
 
 
