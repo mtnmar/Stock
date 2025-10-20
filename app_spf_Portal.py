@@ -1027,6 +1027,10 @@ else:
                     company_for_save = title_companies if title_companies else '(unknown)'
                 ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact="")
 
+                # Debug: show which contact row we matched for this username
+                _udf, _ = _user_table(ACTIVE_DB_PATH)
+                _cname, _cemail, _cphone = _match_user_contact(_udf, company_for_save, str(username))
+                st.caption(f"Matched contact for username '{username}': {_cname or '(none)'} | {_cemail or '(no email)'} | {('Phone: '+_cphone) if _cphone else '(no phone)'}")
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote(
                     ACTIVE_DB_PATH,
@@ -1265,4 +1269,3 @@ else:
                                                file_name=f"{qnum2}_{safe_name}.docx",
                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                                key=f"gen_dl_{rec['id']}")
-
