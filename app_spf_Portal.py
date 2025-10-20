@@ -10,6 +10,8 @@
 # ✅ Cart buttons: Remove (left, small) | Clear, Save, Generate, Email (right, small)
 # ✅ Quotes page: New (choose Location & Vendor, autofill addresses), Browse/Edit (filter by company)
 # ✅ NEW: RE-STOCK user filter (between the table and the cart) to choose requestor before Generate
+# ✅ NEW: Generate always inserts a NEW quote (no overwrites); Browse/Edit has "Generate New Copy"
+# ✅ NEW: Quotes page "Refresh quotes" button; auto-increment quote number on conflicts
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -31,7 +33,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-USER-FILTER"
+APP_VERSION = "2025.10.20-NO-OVERWRITE"
 
 # ---- deps ----
 try:
@@ -312,6 +314,21 @@ def save_quote(db_path: str, *, quote_number: Optional[str], company: str, creat
             conn.commit()
             return int(quote_id), quote_number
 
+def save_quote_safe(db_path: str, **kwargs) -> Tuple[int, str]:
+    """
+    Always create a new quote if possible. If a duplicate quote_number was provided,
+    auto-pick the next available number and insert a fresh row.
+    """
+    try:
+        return save_quote(db_path, **kwargs)
+    except sqlite3.IntegrityError:
+        # quote_number conflict -> generate a fresh one
+        new_no = _next_quote_number(db_path, datetime.utcnow())
+        kwargs = dict(kwargs)
+        kwargs["quote_number"] = new_no
+        kwargs["quote_id"] = None
+        return save_quote(db_path, **kwargs)
+
 def load_quote(db_path: str, quote_id: int) -> Optional[dict]:
     ensure_quotes_table(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -476,7 +493,7 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
     addr2 = _first_nonempty(arow, ["Address 2","Address2","Line2","Street 2"])
     if addr2: ship_lines.append(addr2)
 
-    # City/State/Zip combined preferred ("City,Sate,Zip" exact header from your DB)
+    # City/State/Zip combined preferred
     combined = ""
     for cand in ["City,Sate,Zip","City,State,Zip","City_State_Zip","City, ST Zip","City State Zip"]:
         if cand in arow.index and str(arow.get(cand,"")).strip():
@@ -505,9 +522,6 @@ def build_ship_bill_blocks(db_path: str, company: str, username: str) -> Tuple[s
 
 # ---------- Word helpers ----------
 def _remove_table_borders(table) -> None:
-    """
-    Remove all borders from a python-docx table (safe, no AttributeError).
-    """
     tbl = table._tbl
     tblPr = tbl.tblPr or tbl.get_or_add_tblPr()
     for child in list(tblPr):
@@ -526,13 +540,6 @@ def _remove_table_borders(table) -> None:
 def build_quote_docx(*, company: str, date_str: str, quote_number: str,
                      vendor_text: str, ship_to_text: str, bill_to_text: str,
                      lines_df: pd.DataFrame) -> bytes:
-    """
-    Build professional quote request:
-      - Header with Company (prefix removed), title, date, quote#
-      - Vendor
-      - Side-by-side Ship To (left) and Bill To (right) with NO borders
-      - Lines table: Part Number, Description, Quantity, Price/Unit, Total
-    """
     doc = Document()
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(10)
@@ -556,7 +563,7 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     vr = doc.add_paragraph(); vr.add_run("Vendor").bold = True
     doc.add_paragraph(vendor_text if vendor_text.strip() else "_____________________________")
 
-    # Addresses table (2x2): header row + values row
+    # Addresses (Ship/Bill)
     doc.add_paragraph("")
     tbl_addr = doc.add_table(rows=2, cols=2)
     hdr = tbl_addr.rows[0].cells
@@ -565,7 +572,6 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     vals = tbl_addr.rows[1].cells
     vals[0].text = ship_to_text
     vals[1].text = bill_to_text
-
     _remove_table_borders(tbl_addr)
 
     # Lines
@@ -582,7 +588,6 @@ def build_quote_docx(*, company: str, date_str: str, quote_number: str,
     for j in range(len(cols)):
         for r in tbl.rows:
             r.cells[j].width = widths[j]
-
     for j,c in enumerate(cols):
         tbl.cell(0,j).text = c
     for i,(_,r) in enumerate(lines.iterrows(), start=1):
@@ -794,6 +799,7 @@ else:
                 diff = (m - s).clip(lower=0); return diff.apply(lambda x: "" if pd.isna(x) else str(int(float(x))) if float(x).is_integer() else str(x))
             add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
 
+            vendor_col = vendor_col
             if vendor_col:
                 sel_vendors = sorted(set(add_df[vendor_col].dropna().astype(str).str.strip()))
                 cart_df = st.session_state[cart_key]
@@ -848,7 +854,6 @@ else:
             key="contact_user_override",
             help="This user’s Contact/Email/Phone will appear under the Ship To block when you Generate.",
         )
-        # live preview of the matched contact fields
         cname, cemail, cphone = _match_user_contact(udf, company="", username=contact_user)
         st.caption(f"Using: {cname or '(no name)'} | {cemail or '(no email)'} | {('Phone: '+cphone) if cphone else '(no phone)'}")
 
@@ -922,15 +927,14 @@ else:
             st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns)+["__QTY__"])
             st.session_state[cart_base] += 1; st.rerun()
 
-        # Generate: save quote, then present download
+        # Generate: save NEW quote, then present download
         if gen_clicked:
             if st.session_state[cart_key].empty:
                 st.warning("Cart is empty.")
             else:
-                # Vendor text (single vendor preferred)
                 vendor_text = "_____________________________"
-                if vendor_col and vendor_col in st.session_state[cart_key].columns:
-                    vendors = sorted(set(st.session_state[cart_key][vendor_col].dropna().astype(str).str.strip()))
+                if vd and vd in st.session_state[cart_key].columns:
+                    vendors = sorted(set(st.session_state[cart_key][vd].dropna().astype(str).str.strip()))
                     if len(vendors) == 1:
                         vendor_text = vendors[0]
                     elif len(vendors) > 1:
@@ -946,7 +950,7 @@ else:
                     "Total":       ""
                 })
 
-                # Derive Location from the cart rows (must be single location)
+                # Derive Location (must be single)
                 company_for_save = None
                 if 'Company' in st.session_state[cart_key].columns:
                     cart_companies = (
@@ -963,13 +967,12 @@ else:
                 if not company_for_save:
                     company_for_save = chosen if chosen != ADMIN_ALL else '(unknown)'
 
-                # Use selected requestor (fallback to logged-in username if selector missing)
                 use_user = st.session_state.get("contact_user_override", str(username))
-
                 ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, use_user)
 
+                # Always insert a NEW quote number
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
-                qid, qnum = save_quote(
+                qid, qnum = save_quote_safe(
                     ACTIVE_DB_PATH,
                     quote_number=next_no,
                     company=company_for_save,
@@ -1047,6 +1050,13 @@ else:
         st.markdown(f"### Quotes — {title_companies}")
         ensure_quotes_table(ACTIVE_DB_PATH)
 
+        # Quick refresh for this page only
+        r1, r2 = st.columns([1,6])
+        if r1.button("🔄 Refresh quotes"):
+            st.cache_data.clear()
+            st.rerun()
+        r2.caption(f"DB: {Path(ACTIVE_DB_PATH).resolve()} • Total: {quotes_count(ACTIVE_DB_PATH)}")
+
         include_all = is_admin  # admins default to seeing all
         if is_admin:
             include_all = st.toggle("Show all companies", value=True)
@@ -1059,10 +1069,8 @@ else:
 
         # NEW QUOTE
         with tab_new:
-            # Let user choose Location (Company) for this new quote
             try_default_idx = company_options.index(chosen) if chosen in company_options else 0
             company_new = st.selectbox("Location", options=company_options, index=try_default_idx)
-            # Choose vendor
             if vendor_names:
                 vendor = st.selectbox("Vendor", options=[""] + vendor_names, index=0)
             else:
@@ -1072,7 +1080,6 @@ else:
                 st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
             quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no, help="QR-YYYY-####")
 
-            # Prefill addresses from DB for selected company
             ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_new, str(username))
             c1, c2 = st.columns(2)
             with c1:
@@ -1099,8 +1106,8 @@ else:
             c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
             with c_save:
                 if st.button("Save", use_container_width=True):
-                    qid, qnum = save_quote(ACTIVE_DB_PATH,
-                                           quote_number=quote_no or None,
+                    qid, qnum = save_quote_safe(ACTIVE_DB_PATH,
+                                           quote_number=(quote_no or None),
                                            company=company_new,
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
@@ -1109,8 +1116,8 @@ else:
                     st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
             with c_gen:
                 if st.button("Generate", use_container_width=True):
-                    qid, qnum = save_quote(ACTIVE_DB_PATH,
-                                           quote_number=quote_no or None,
+                    qid, qnum = save_quote_safe(ACTIVE_DB_PATH,
+                                           quote_number=(quote_no or None),
                                            company=company_new,
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
@@ -1126,6 +1133,7 @@ else:
                     st.download_button("Download Quote (Word)", data=doc_bytes,
                                        file_name=f"{qnum}_{sanitize_filename(company_new)}.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    st.session_state.new_quote_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
             with c_email:
                 st.button("Email", use_container_width=True, disabled=True)
 
@@ -1168,23 +1176,26 @@ else:
                         }
                     )
 
-                    c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
+                    c_left, c_sp, c_save, c_gen_new, c_email = st.columns([4,5,1,1,1])
                     with c_save:
-                        if st.button("Save", key=f"save_quote_{rec['id']}", use_container_width=True):
+                        if st.button("Save (update existing)", key=f"save_quote_{rec['id']}", use_container_width=True):
+                            # This UPDATE modifies the current record
                             save_quote(ACTIVE_DB_PATH, quote_number=quote_no or None,
                                        company=rec["company"],
                                        created_by=str(username),
                                        vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
                                        lines_df=edited_exist, quote_id=int(rec["id"]))
-                            st.success("Saved")
-                    with c_gen:
-                        if st.button("Generate", key=f"gen_btn_{rec['id']}", use_container_width=True):
-                            qid2, qnum2 = save_quote(ACTIVE_DB_PATH, quote_number=quote_no or None,
+                            st.success("Saved changes to existing quote.")
+                    with c_gen_new:
+                        if st.button("Generate New Copy", key=f"gen_new_{rec['id']}", use_container_width=True):
+                            # This INSERT creates a NEW record with a fresh number
+                            new_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
+                            qid2, qnum2 = save_quote_safe(ACTIVE_DB_PATH, quote_number=new_no,
                                                      company=rec["company"],
                                                      created_by=str(username),
                                                      vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
-                                                     lines_df=edited_exist, quote_id=int(rec["id"]))
-                            st.success(f"Saved quote #{qid2} ({qnum2})")
+                                                     lines_df=edited_exist)
+                            st.success(f"Saved NEW quote #{qid2} ({qnum2})")
                             doc_bytes = build_quote_docx(
                                 company=rec["company"],
                                 date_str=(rec["quote_date"] or datetime.now().strftime("%Y-%m-%d")),
@@ -1203,3 +1214,4 @@ else:
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
