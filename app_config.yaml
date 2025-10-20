@@ -1,5 +1,3 @@
-# app_config.yaml  (place beside app_spf_Portal.py in the repo root)
-
 credentials:
   usernames:
     brad:
@@ -13,7 +11,7 @@ credentials:
 
 cookie:
   name: spf_po_portal
-  key: change_me_in_yaml
+  key: "use-a-long-random-string-here"
   expiry_days: 7
 
 access:
@@ -23,11 +21,9 @@ access:
     demo: ['*']
 
 settings:
-  # <<< point explicitly to the DB that lives in this repo >>>
-  db_path: "./maintainx_po.db"
+  db_path: "./maintainx_po.db"   # <— DB lives next to the app file
 
-  # (optional) If you aren’t using Parquet, remove this block entirely.
+  # (remove or leave commented if you’re not using Parquet)
   # parquet:
   #   restock: ""
   #   po_outstanding: ""
-
