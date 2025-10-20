@@ -623,17 +623,33 @@ else:
     def load_src(src: str):
         pq_path = parquet_available_for(src, pq_paths)
         if pq_path:
-            df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
-            cols_in_db = list(df_all.columns)
-            comp_col = "Company" if "Company" in df_all.columns else None
-            all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
-            return df_all, cols_in_db, all_companies, pq_path
-        else:
-            # EXACTLY like before: query the logical table name directly (e.g., [restock])
+            try:
+                df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
+                cols_in_db = list(df_all.columns)
+                comp_col = "Company" if "Company" in df_all.columns else None
+                all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
+                return df_all, cols_in_db, all_companies, pq_path
+            except Exception as e:
+                st.warning(f"Parquet read failed for {pq_path.name} on '{src}': {e}. Falling back to SQLite.")
+        # SQLite path (resilient): try logical table name first, then resolve_sql_table()
+        try:
             all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1")
             all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
             cols_in_db = table_columns_in_order(None, src)
             return None, cols_in_db, all_companies, None
+        except Exception as e:
+            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
+            if tbl:
+                try:
+                    all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{tbl}] WHERE [Company] IS NOT NULL ORDER BY 1")
+                    all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
+                    cols_in_db = table_columns_in_order(None, tbl)
+                    return None, cols_in_db, all_companies, None
+                except Exception as e2:
+                    st.warning(f"Failed to read companies from table [{tbl}]: {e2}")
+            else:
+                st.warning(f"No SQLite table found for logical source '{src}'.")
+            return None, [], [], None
 
     # Pull companies from source
     _, cols_any, all_companies, _ = load_src("restock")
@@ -727,7 +743,13 @@ else:
         else:
             label = 'Search Part Numbers / Name contains'
             search = st.sidebar.text_input(label, key="search_restock")
-            cols_in_db = table_columns_in_order(None, src)
+            try:
+                cols_in_db = table_columns_in_order(None, src)
+                active_tbl = src
+            except Exception:
+                resolved = resolve_sql_table(src, ACTIVE_DB_PATH)
+                cols_in_db = table_columns_in_order(None, resolved) if resolved else []
+                active_tbl = resolved or src
             vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
             if vendor_col:
                 st.sidebar.caption("Tip: search also checks Vendor")
@@ -744,8 +766,13 @@ else:
                     where.append("([Part Numbers] LIKE ? OR [Name] LIKE ?)")
                     params += [f"%{search}%"]*2
             where_sql = " AND ".join(where) if where else "1=1"
-            sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], [Name]"
-            df = q(sql, tuple(params))
+            try:
+                sql = f"SELECT * FROM [{active_tbl}] WHERE {where_sql} ORDER BY [Company], [Name]"
+                df = q(sql, tuple(params))
+            except Exception:
+                resolved = resolve_sql_table(src, ACTIVE_DB_PATH)
+                sql = f"SELECT * FROM [{resolved or src}] WHERE {where_sql} ORDER BY [Company], [Name]"
+                df = q(sql, tuple(params))
 
         df = strip_time(df, DATE_COLS.get(src, []))
         # attach row key
@@ -1001,8 +1028,13 @@ else:
                 where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
                 params += [f"%{search}%"]*4
             where_sql = " AND ".join(where) if where else "1=1"
-            sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
-            df = q(sql, tuple(params))
+            try:
+                sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
+                df = q(sql, tuple(params))
+            except Exception:
+                resolved = resolve_sql_table(src, ACTIVE_DB_PATH)
+                sql = f"SELECT * FROM [{resolved or src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
+                df = q(sql, tuple(params))
         df = strip_time(df, DATE_COLS.get(src, []))
         hide_set = set(HIDE_COLS.get(src, []))
         display_cols = [c for c in df.columns if c not in hide_set and c != "Company"]
