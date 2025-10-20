@@ -623,24 +623,16 @@ else:
     def load_src(src: str):
         pq_path = parquet_available_for(src, pq_paths)
         if pq_path:
-            try:
-                df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
-            except Exception as e:
-                st.warning(f"Parquet read failed for {pq_path.name} on '{src}': {e}. Falling back to SQLite.")
-                pq_path = None
-
-        if pq_path:
+            df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
             cols_in_db = list(df_all.columns)
             comp_col = "Company" if "Company" in df_all.columns else None
             all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
             return df_all, cols_in_db, all_companies, pq_path
         else:
-            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
-            if not tbl:
-                return None, [], [], None
-            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{tbl}] WHERE [Company] IS NOT NULL ORDER BY 1")
+            # EXACTLY like before: query the logical table name directly (e.g., [restock])
+            all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{src}] WHERE [Company] IS NOT NULL ORDER BY 1")
             all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
-            cols_in_db = table_columns_in_order(None, tbl)
+            cols_in_db = table_columns_in_order(None, src)
             return None, cols_in_db, all_companies, None
 
     # Pull companies from source
@@ -733,31 +725,27 @@ else:
             order_cols = [c for c in ["Company","Name"] if c in df.columns]
             df = df.sort_values(order_cols) if order_cols else df
         else:
-            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
             label = 'Search Part Numbers / Name contains'
             search = st.sidebar.text_input(label, key="search_restock")
-            if not tbl:
-                df = pd.DataFrame()
-            else:
-                cols_in_db = table_columns_in_order(None, tbl)
-                vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
+            cols_in_db = table_columns_in_order(None, src)
+            vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
+            if vendor_col:
+                st.sidebar.caption("Tip: search also checks Vendor")
+            where = []; params = []
+            if chosen_companies:
+                ph = ','.join(['?']*len(chosen_companies))
+                where.append(f"[Company] IN ({ph})")
+                params += list(chosen_companies)
+            if search:
                 if vendor_col:
-                    st.sidebar.caption("Tip: search also checks Vendor")
-                where = []; params = []
-                if chosen_companies:
-                    ph = ','.join(['?']*len(chosen_companies))
-                    where.append(f"[Company] IN ({ph})")
-                    params += list(chosen_companies)
-                if search:
-                    if vendor_col:
-                        where.append(f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)")
-                        params += [f"%{search}%"]*3
-                    else:
-                        where.append("([Part Numbers] LIKE ? OR [Name] LIKE ?)")
-                        params += [f"%{search}%"]*2
-                where_sql = " AND ".join(where) if where else "1=1"
-                sql = f"SELECT * FROM [{tbl}] WHERE {where_sql} ORDER BY [Company], [Name]"
-                df = q(sql, tuple(params))
+                    where.append(f"([Part Numbers] LIKE ? OR [Name] LIKE ? OR [{vendor_col}] LIKE ?)")
+                    params += [f"%{search}%"]*3
+                else:
+                    where.append("([Part Numbers] LIKE ? OR [Name] LIKE ?)")
+                    params += [f"%{search}%"]*2
+            where_sql = " AND ".join(where) if where else "1=1"
+            sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], [Name]"
+            df = q(sql, tuple(params))
 
         df = strip_time(df, DATE_COLS.get(src, []))
         # attach row key
@@ -1003,22 +991,18 @@ else:
                 else:
                     df = df.assign(_co=co).sort_values(["_co"]).drop(columns=["_co"])
         else:
-            tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
             search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains', key="search_pos")
-            if not tbl:
-                df = pd.DataFrame()
-            else:
-                where = []; params = []
-                if chosen_companies:
-                    ph = ','.join(['?']*len(chosen_companies))
-                    where.append(f"[Company] IN ({ph})")
-                    params += list(chosen_companies)
-                if search:
-                    where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
-                    params += [f"%{search}%"]*4
-                where_sql = " AND ".join(where) if where else "1=1"
-                sql = f"SELECT * FROM [{tbl}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
-                df = q(sql, tuple(params))
+            where = []; params = []
+            if chosen_companies:
+                ph = ','.join(['?']*len(chosen_companies))
+                where.append(f"[Company] IN ({ph})")
+                params += list(chosen_companies)
+            if search:
+                where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
+                params += [f"%{search}%"]*4
+            where_sql = " AND ".join(where) if where else "1=1"
+            sql = f"SELECT * FROM [{src}] WHERE {where_sql} ORDER BY [Company], date([Created On]) ASC, [Purchase Order #]"
+            df = q(sql, tuple(params))
         df = strip_time(df, DATE_COLS.get(src, []))
         hide_set = set(HIDE_COLS.get(src, []))
         display_cols = [c for c in df.columns if c not in hide_set and c != "Company"]
