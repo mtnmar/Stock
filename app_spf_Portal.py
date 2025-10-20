@@ -2,12 +2,12 @@
 # --------------------------------------------------------------
 # SPF portal for RE-STOCK, Outstanding POs, and Quotes
 #
-# ✅ Saves quotes to SQLite table 'quotes' and downloads Word on Generate
-# ✅ Removes numeric "### -" prefix from Company ONLY in Word document
-# ✅ Ship To: from 'addresses' (Company -> Address1/2/City/State/Zip) + user contact from 'user_data'
-# ✅ Bill To: fixed, same for all companies (override via config if needed)
-# ✅ RE-STOCK XLSX download kept; Cart buttons: Remove | Clear | Save | Generate
-# ✅ Quotes page: New (choose Location & Vendor, autofill addresses), Browse/Edit (filter by company)
+# ✅ Sidebar always shows: Page radio, Company picker, Search fields
+# ✅ Save quotes to SQLite table 'quotes' and download Word on Generate
+# ✅ Strip numeric "### -" prefix from Company ONLY in the Word doc
+# ✅ Bill-To is fixed (same for all quotes; override via config)
+# ✅ Ship-To from 'addresses' + user contact from 'user_data'/'User_Data'
+# ✅ Parquet -> SQLite fallback (or force SQLite via SPF_DISABLE_PARQUET=1)
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -30,9 +30,9 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-hotfixA"
+APP_VERSION = "2025.10.20-ui-restore"
 
-# Optional switch to bypass Parquet fast-path entirely (set env SPF_DISABLE_PARQUET=1)
+# ---- env toggles ----
 DISABLE_PARQUET = str(os.environ.get('SPF_DISABLE_PARQUET', '0')).lower() in {'1','true','yes','on'}
 
 # ---- deps ----
@@ -58,7 +58,7 @@ DEFAULT_DB = "maintainx_po.db"
 HERE = Path(__file__).resolve().parent
 ACTIVE_DB_PATH: str | None = None  # set after resolve
 
-# Fixed Bill-To (global default). You can override via secrets['app_config']['billing']['lines']
+# Fixed Bill-To (override via secrets['app_config']['billing']['lines'])
 BILL_TO_FIXED = [
     "P.O. Box 1900",
     "Morgantown, WV, 26507",
@@ -73,7 +73,6 @@ credentials:
     demo:
       name: Demo User
       email: demo@example.com
-      # bcrypt hash for 'demo'
       password: "$2b$12$y2J3Y0rRrJ3fA76h2o//mO6F1T0m3b1vS7QhQ4bW5iX9b5b5b5b5e"
 
 cookie:
@@ -191,14 +190,6 @@ def list_sqlite_tables(db_path: str) -> list[str]:
         return []
 
 def resolve_sql_table(logical: str, db_path: str) -> str | None:
-    """
-    Map logical names ('restock', 'po_outstanding') to actual SQLite table names.
-    Priority:
-      1) Explicit env override
-      2) Exact match (case-insensitive)
-      3) Fuzzy contains (e.g., 'restock' in table name)
-      4) First table that has a 'Company' column
-    """
     env_map = {
         "restock": os.environ.get("SPF_SQL_TABLE_RESTOCK"),
         "po_outstanding": os.environ.get("SPF_SQL_TABLE_PO_OUT"),
@@ -229,6 +220,22 @@ def resolve_sql_table(logical: str, db_path: str) -> str | None:
         except Exception:
             pass
     return None
+
+# ---- Excel export ----
+def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
+    import xlsxwriter
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
+        df.to_excel(w, index=False, sheet_name=sheet)
+        ws = w.sheets[sheet]
+        ws.autofilter(0,0,max(0,len(df)), max(0,len(df.columns)-1))
+        for i,_ in enumerate(df.columns):
+            try:
+                width = 16 if df.empty else min(60, max(12, int(df.iloc[:,i].astype(str).str.len().quantile(0.9))+2))
+                ws.set_column(i,i,width)
+            except Exception:
+                pass
+    return buf.getvalue()
 
 # ---------- Quote storage ----------
 def ensure_quotes_table(db_path: str) -> None:
@@ -359,25 +366,6 @@ def _load_table(db_path: str, name: str) -> pd.DataFrame:
             return pd.read_sql_query(f"SELECT * FROM [{name}]", conn)
     except Exception:
         return pd.DataFrame()
-def companies_from_anywhere(db_path: str, existing: list[str]) -> list[str]:
-    """Fallback source of company names.
-    1) If existing list is non-empty, return it.
-    2) Else try 'addresses' table distinct Company/Location/Site/Name.
-    """
-    if existing:
-        return existing
-    adr = _load_table(db_path, "addresses")
-    if not adr.empty:
-        key = None
-        for cand in ["Company","Location","Site","Name"]:
-            if cand in adr.columns:
-                key = cand; break
-        if key:
-            vals = adr[key].dropna().astype(str).str.strip()
-            out = sorted(v for v in vals.unique().tolist() if v)
-            return out
-    return []
-
 
 def _user_table(db_path: str) -> Tuple[pd.DataFrame, str]:
     for nm in ["user_data", "User_Data", "user_contacts"]:
@@ -597,8 +585,8 @@ def label_for_source(engine: str, path: Optional[str]) -> str:
 
 # ---------- App ----------
 cfg = load_config(); cfg = to_plain(cfg)
-cookie_cfg = cfg.get('cookie', {})
 
+cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
     cookie_cfg.get('name', 'spf_po_portal_v3'),
@@ -615,6 +603,7 @@ else:
     auth.logout('Logout', 'sidebar')
     st.sidebar.success(f"Logged in as {name}")
 
+    # Resolve DB path + expose in UI
     db_path = resolve_db_path(cfg)
     ACTIVE_DB_PATH = db_path
     pq_paths = detect_parquet_paths(cfg)
@@ -627,9 +616,10 @@ else:
     st.sidebar.caption(f"Quotes in DB: **{quotes_count(db_path)}**")
     if st.sidebar.button("🔄 Refresh data"): st.cache_data.clear()
 
+    # Always render the page radio first
     page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0)
 
-    # Loaders (for companies list)
+    # Loader that prefers Parquet but falls back to SQLite for: columns + companies
     def load_src(src: str):
         pq_path = parquet_available_for(src, pq_paths)
         if pq_path:
@@ -647,61 +637,69 @@ else:
         else:
             tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
             if not tbl:
-                all_companies = []
-                cols_in_db = []
-                return None, cols_in_db, all_companies, None
+                return None, [], [], None
             all_companies_df = q(f"SELECT DISTINCT [Company] FROM [{tbl}] WHERE [Company] IS NOT NULL ORDER BY 1")
             all_companies = [str(x) for x in all_companies_df['Company'].dropna().tolist()] or []
             cols_in_db = table_columns_in_order(None, tbl)
             return None, cols_in_db, all_companies, None
 
+    # Pull companies from source
     _, cols_any, all_companies, _ = load_src("restock")
-    all_companies = companies_from_anywhere(ACTIVE_DB_PATH, all_companies)
+    # Fallback to addresses table if needed (always show picker)
+    if not all_companies:
+        adr = _load_table(ACTIVE_DB_PATH, "addresses")
+        key = next((c for c in ["Company","Location","Site","Name"] if c in adr.columns), None)
+        if key:
+            all_companies = sorted({str(x).strip() for x in adr[key].dropna().tolist() if str(x).strip()})
+
+    # ACLs (admins default to all if nothing configured)
     username_ci = str(username).casefold()
-    admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
-    is_admin = username_ci in admin_users_ci
+    cfg_admins = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
+    env_admins = {u.strip().casefold() for u in (os.environ.get('SPF_ADMIN_USERS','').split(',') if os.environ.get('SPF_ADMIN_USERS') else []) if u.strip()}
+    is_admin = (username_ci in (cfg_admins | env_admins)) or (len(cfg_admins | env_admins) == 0)
+
     uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
     uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
     allowed_cfg = uc_ci_map.get(username_ci, [])
     if isinstance(allowed_cfg, str): allowed_cfg = [allowed_cfg]
     allowed_cfg = [a for a in (allowed_cfg or [])]
+
     def norm(s: str) -> str: return " ".join(str(s).strip().split()).casefold()
     db_map = {norm(c): c for c in all_companies}
     allowed_norm = {norm(a) for a in allowed_cfg}
     star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
-    if is_admin or star_granted: allowed_set = set(all_companies)
+
+    if is_admin or star_granted:
+        allowed_set = set(all_companies)
     else:
         matches = {db_map[n] for n in allowed_norm if n in db_map}
-        allowed_set = matches if matches else set(allowed_cfg)
-    if not allowed_set:
-        env_allow_all = str(os.environ.get('SPF_ALLOW_ALL','0')).lower() in {'1','true','yes','on'}
-        if is_admin or env_allow_all:
-            allowed_set = set(all_companies)
-        else:
-            st.error("No companies configured for your account. Ask an admin to update your access.")
-            with st.expander("Company values present in data"): st.write(sorted(all_companies))
-            st.stop()
-        with st.expander("Company values present in data"): st.write(sorted(all_companies))
-        st.stop()
+        allowed_set = matches if matches else set()
 
-    company_options = sorted(allowed_set)
+    # ---- Sidebar company picker (ALWAYS RENDERED) ----
     ADMIN_ALL = "« All companies (admin) »"
-    select_options = ["— Choose company —"]
-    if is_admin and len(all_companies) > 1: select_options += [ADMIN_ALL]
-    select_options += company_options
+    base_options = ["— Choose company —"]
+    if is_admin and len(all_companies) > 1:
+        base_options += [ADMIN_ALL]
+    company_options = sorted(allowed_set) if allowed_set else sorted(all_companies)
+    select_options = base_options + company_options
+
+    # For admins, default to "All companies" if available, else first company
     default_index = 0
-    if is_admin and company_options:
-        default_index = 2 if (is_admin and len(all_companies) > 1) else 1
+    if is_admin and len(select_options) > 1:
+        default_index = 1 if (select_options[1] == ADMIN_ALL) else 1
+
     chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=min(default_index, len(select_options)-1))
-    if chosen == "— Choose company —":
-        if is_admin and all_companies:
-            chosen_companies = sorted(all_companies); title_companies = "All companies (admin)"
-        else:
-            st.info("Select your Company on the left to load data."); st.stop()
-    elif is_admin and chosen == ADMIN_ALL:
-        chosen_companies = sorted(all_companies); title_companies = "All companies (admin)"
+
+    if is_admin and chosen == ADMIN_ALL:
+        chosen_companies = sorted(all_companies)
+        title_companies = "All companies (admin)"
+    elif chosen == "— Choose company —":
+        # If nothing chosen, don't block UI — show empty sections with search
+        chosen_companies = []
+        title_companies = "(no company selected)"
     else:
-        chosen_companies = [chosen]; title_companies = chosen
+        chosen_companies = [chosen]
+        title_companies = chosen
 
     # ----------------- RE-STOCK -----------------
     if page == "RE-STOCK":
@@ -721,10 +719,10 @@ else:
             if 'vendors' in lower_map: vendor_col = lower_map['vendors']
             elif 'vendor' in lower_map: vendor_col = lower_map['vendor']
             df = df_all.copy()
-            if "Company" in df.columns:
+            if "Company" in df.columns and chosen_companies:
                 df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
             label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
-            search = st.sidebar.text_input(label)
+            search = st.sidebar.text_input(label, key="search_restock")
             if search:
                 s = str(search); cols = ["Part Numbers","Name"] + ([vendor_col] if vendor_col else [])
                 ok = pd.Series(False, index=df.index)
@@ -736,14 +734,15 @@ else:
             df = df.sort_values(order_cols) if order_cols else df
         else:
             tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
+            label = 'Search Part Numbers / Name contains'
+            search = st.sidebar.text_input(label, key="search_restock")
             if not tbl:
-                st.warning("No SQLite table found for RE-STOCK (expected a table like 'restock'). Showing empty view.")
                 df = pd.DataFrame()
             else:
                 cols_in_db = table_columns_in_order(None, tbl)
                 vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
-                label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
-                search = st.sidebar.text_input(label)
+                if vendor_col:
+                    st.sidebar.caption("Tip: search also checks Vendor")
                 where = []; params = []
                 if chosen_companies:
                     ph = ','.join(['?']*len(chosen_companies))
@@ -761,8 +760,7 @@ else:
                 df = q(sql, tuple(params))
 
         df = strip_time(df, DATE_COLS.get(src, []))
-
-        # Attach key and display
+        # attach row key
         def attach_row_key(df_in: pd.DataFrame) -> pd.DataFrame:
             df_in = df_in.copy()
             key_col = next((c for c in ["ID","id","Purchase Order ID","Row ID","RowID"] if c in df_in.columns), None)
@@ -774,8 +772,8 @@ else:
             s = df_in[cols].astype(str).agg("|".join, axis=1)
             df_in["__KEY__"] = s.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
             return df_in
-
         df = attach_row_key(df)
+
         hide_set = set(HIDE_COLS.get(src, [])) | {"__KEY__","__QTY__"}
         cols_for_download = [c for c in df.columns if (c not in hide_set)]
 
@@ -804,7 +802,7 @@ else:
         except Exception: selected_idx = []
         selected_rows = df.loc[selected_idx] if len(selected_idx) else df.iloc[0:0]
 
-        cart_key = f"cart_{src}_{hashlib.md5(('|'.join([str(x) for x in chosen_companies])).encode()).hexdigest()}"
+        cart_key = f"cart_{src}_{hashlib.md5(('|'.join([str(x) for x in chosen_companies]) or 'all').encode()).hexdigest()}"
         if cart_key not in st.session_state:
             st.session_state[cart_key] = pd.DataFrame(columns=list(df.columns)+["__QTY__"])
 
@@ -818,11 +816,8 @@ else:
                 diff = (m - s).clip(lower=0); return diff.apply(lambda x: "" if pd.isna(x) else str(int(float(x))) if float(x).is_integer() else str(x))
             add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
 
-            lower_map = {c.lower(): c for c in add_df.columns}
-            if 'vendors' in lower_map: vendor_col = lower_map['vendors']
-            elif 'vendor' in lower_map: vendor_col = lower_map['vendor']
-
-            if vendor_col:
+            # per-vendor cart guard
+            if vendor_col and vendor_col in add_df.columns:
                 sel_vendors = sorted(set(add_df[vendor_col].dropna().astype(str).str.strip()))
                 cart_df = st.session_state[cart_key]
                 cart_vendors = sorted(set(cart_df[vendor_col].dropna().astype(str).str.strip())) if (not cart_df.empty and vendor_col in cart_df.columns) else []
@@ -837,6 +832,7 @@ else:
                     add_df = add_df[add_df[vendor_col].astype(str).str.strip()==chosen_vendor]
                     skipped = before - len(add_df)
                     if skipped>0: st.warning(f"Cart locked to Vendor '{chosen_vendor}'. Skipped {skipped} item(s).")
+
             merged = pd.concat([st.session_state[cart_key], add_df], ignore_index=True)
             st.session_state[cart_key] = merged.drop_duplicates(subset="__KEY__", keep="first").reset_index(drop=True)
             st.success(f"Added {len(add_df)} item(s) to cart."); st.rerun()
@@ -852,6 +848,7 @@ else:
                                file_name="RE_STOCK.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        # ----------------- Cart area -----------------
         cart_df: pd.DataFrame = st.session_state[cart_key]
         st.markdown(f"#### Cart ({len(cart_df)} item{'s' if len(cart_df)!=1 else ''})")
         if cart_df.empty:
@@ -942,7 +939,7 @@ else:
                     "Total":       ""
                 })
 
-                company_for_save = chosen if chosen != ADMIN_ALL else "All companies (admin)"
+                company_for_save = title_companies if title_companies else "(unknown)"
                 ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact=str(name))
 
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
@@ -968,10 +965,11 @@ else:
                     bill_to_text=bill_to,
                     lines_df=lines_df
                 )
+                safe_name = re.sub(r'[^A-Za-z0-9._ -]+', '_', str(company_for_save or '')).strip()[:80] or 'Quote'
                 st.download_button(
                     "Download Quote (Word)",
                     data=doc_bytes,
-                    file_name=f"{qnum}_{re.sub(r'[^A-Za-z0-9._ -]+', '_', str(company_for_save or '')).strip()[:80] or 'Quote'}.docx",
+                    file_name=f"{qnum}_{safe_name}.docx",
                     mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
 
@@ -988,9 +986,9 @@ else:
 
         if pq_path:
             df = df_all.copy()
-            if "Company" in df.columns:
+            if "Company" in df.columns and chosen_companies:
                 df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
-            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
+            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains', key="search_pos")
             if search:
                 s = str(search); cols = ["Purchase Order #","Vendor","Part Number","Line Name"]
                 ok = pd.Series(False, index=df.index)
@@ -1006,9 +1004,8 @@ else:
                     df = df.assign(_co=co).sort_values(["_co"]).drop(columns=["_co"])
         else:
             tbl = resolve_sql_table(src, ACTIVE_DB_PATH)
-            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
+            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains', key="search_pos")
             if not tbl:
-                st.warning("No SQLite table found for Outstanding POs (expected a table like 'po_outstanding'). Showing empty view.")
                 df = pd.DataFrame()
             else:
                 where = []; params = []
@@ -1048,8 +1045,9 @@ else:
         vendor_names = sorted(vendors_df["Vendor"].dropna().astype(str).unique().tolist()) if ("Vendor" in vendors_df.columns and not vendors_df.empty) else []
 
         with tab_new:
-            try_default_idx = company_options.index(chosen) if chosen in company_options else 0
-            company_new = st.selectbox("Location", options=company_options, index=try_default_idx)
+            try_default_idx = 0
+            base_opts = company_options if company_options else ["(no companies)"]
+            company_new = st.selectbox("Location", options=base_opts, index=min(try_default_idx, max(0, len(base_opts)-1)))
             if vendor_names:
                 vendor = st.selectbox("Vendor", options=[""] + vendor_names, index=0)
             else:
@@ -1109,12 +1107,13 @@ else:
                         vendor_text=vendor, ship_to_text=ship_to, bill_to_text=bill_to,
                         lines_df=edited_new
                     )
+                    safe_name = re.sub(r'[^A-Za-z0-9._ -]+', '_', str(company_new or '')).strip()[:80] or 'Quote'
                     st.download_button("Download Quote (Word)", data=doc_bytes,
-                                       file_name=f"{qnum}_{re.sub(r'[^A-Za-z0-9._ -]+', '_', str(company_new or '')).strip()[:80] or 'Quote'}.docx",
+                                       file_name=f"{qnum}_{safe_name}.docx",
                                        mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
 
         with tab_browse:
-            comp_filter = st.selectbox("Filter by Company", options=["(all)"] + company_options, index=0)
+            comp_filter = st.selectbox("Filter by Company", options=["(all)"] + (company_options or []), index=0)
             dfq = list_quotes(ACTIVE_DB_PATH,
                               company=(None if comp_filter=="(all)" else comp_filter),
                               include_all=(include_all or comp_filter=="(all)"))
@@ -1175,24 +1174,8 @@ else:
                                 vendor_text=vendor, ship_to_text=ship_to, bill_to_text=bill_to,
                                 lines_df=edited_exist
                             )
+                            safe_name = re.sub(r'[^A-Za-z0-9._ -]+', '_', str(rec['company'] or '')).strip()[:80] or 'Quote'
                             st.download_button("Download Quote (Word)", data=doc_bytes,
-                                               file_name=f"{qnum2}_{re.sub(r'[^A-Za-z0-9._ -]+', '_', str(rec['company'] or '')).strip()[:80] or 'Quote'}.docx",
+                                               file_name=f"{qnum2}_{safe_name}.docx",
                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                                key=f"gen_dl_{rec['id']}")
-
-# ---- Excel simple export ----
-def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
-    import xlsxwriter, io
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
-        df.to_excel(w, index=False, sheet_name=sheet)
-        ws = w.sheets[sheet]
-        ws.autofilter(0,0,max(0,len(df)), max(0,len(df.columns)-1))
-        for i,_ in enumerate(df.columns):
-            try:
-                width = 16 if df.empty else min(60, max(12, int(df.iloc[:,i].astype(str).str.len().quantile(0.9))+2))
-                ws.set_column(i,i,width)
-            except Exception:
-                pass
-    return buf.getvalue()
-
