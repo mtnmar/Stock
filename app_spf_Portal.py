@@ -433,41 +433,98 @@ def _bill_to_text(cfg: dict) -> str:
     return "\n".join(cleaned)
 
 def build_ship_bill_blocks(db_path: str, company: str, username: str, cfg: dict, fallback_contact: str="") -> Tuple[str, str]:
+    """
+    Ship To sourcing (DOC ONLY):
+      - Prefer match by addresses.Location == company (the passed value is the UI Location like "110 - Deckers Creek Limestone")
+      - Else match by addresses.Company == prefix-stripped company
+      - First printed line: addresses.Company (clean name, no numeric prefix)
+      - Address1: addresses.Address; Address2: if present (Address 2/Address2/Line2/Street 2)
+      - City/State/Zip: prefer combined column "City,Sate,Zip" (exact header), else compose from City/State/ST/Zip/Postal
+      - Append user contact by exact username from user_contacts (if not found, use fallback_contact for name, no email/phone)
+    Bill To sourcing:
+      - addresses.Billing (semicolon → newlines), plus BillingContact, BillingEmail, BillingPhone
+    """
     adr = _load_table(db_path, "addresses")
     user_df, _ = _user_table(db_path)
-    bill_txt = _bill_to_text(cfg)
 
+    # ---- Bill To ----
+    bill_lines: List[str] = []
+    if not adr.empty and "Billing" in adr.columns:
+        rows_with = adr[adr["Billing"].astype(str).str.strip() != ""]
+        row_b = rows_with.iloc[0] if not rows_with.empty else adr.iloc[0]
+        billing_text = str(row_b.get("Billing","")).strip()
+        if billing_text:
+            bill_lines.extend(_split_semicolon_lines(billing_text))
+        b_contact = str(row_b.get(_pick_first_col(adr, ["Billing Contact","BillingContact"]) or "", "")).strip()
+        b_email   = str(row_b.get(_pick_first_col(adr, ["BillingEmail","Billing Email"]) or "", "")).strip()
+        b_phone   = str(row_b.get(_pick_first_col(adr, ["BillingPhone","Billing Phone"]) or "", "")).strip()
+        if b_contact: bill_lines.append(b_contact)
+        if b_email:   bill_lines.append(b_email)
+        if b_phone:   bill_lines.append(f"Phone: {b_phone}")
+    bill_txt = "\n".join([ln for ln in bill_lines if ln])
+
+    # ---- Ship To ----
     ship_lines: List[str] = []
     arow = pd.Series(dtype="object")
+    printed_company = remove_prefix_for_display(company)
+
     if not adr.empty:
-        comp_col = _pick_first_col(adr, ["Company","Location","Site","Name"]) or "Company"
-        sub = adr[adr[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()]
-        arow = sub.iloc[0] if not sub.empty else adr.iloc[0]
+        # 1) Try exact match on Location
+        loc_col = _pick_first_col(adr, ["Location"])
+        if loc_col and (loc_col in adr.columns):
+            mloc = adr[loc_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
+            if mloc.any():
+                arow = adr[mloc].iloc[0]
+        # 2) Else try match on clean Company
+        if arow.empty:
+            comp_col = _pick_first_col(adr, ["Company"])
+            if comp_col and (comp_col in adr.columns):
+                mcomp = adr[comp_col].astype(str).str.strip().str.casefold() == remove_prefix_for_display(company).casefold()
+                if mcomp.any():
+                    arow = adr[mcomp].iloc[0]
+        if not arow.empty and ("Company" in arow.index):
+            printed_company = str(arow.get("Company") or printed_company)
 
-    ship_lines.append(remove_prefix_for_display(company))
+    # Company line
+    ship_lines.append(str(printed_company).strip())
 
-    addr1_key = _pick_first_col(pd.DataFrame([arow]), ["Address","Address 1","Address1","Street","Line1"]) or ""
-    addr2_key = _pick_first_col(pd.DataFrame([arow]), ["Address 2","Address2","Line2","Street 2"]) or ""
-    if addr1_key and str(arow.get(addr1_key, "")).strip():
-        ship_lines.append(str(arow.get(addr1_key)).strip())
-    if addr2_key and str(arow.get(addr2_key, "")).strip():
-        ship_lines.append(str(arow.get(addr2_key)).strip())
+    # Address lines
+    def _first_nonempty(row, keys):
+        for k in keys:
+            if k in row.index and str(row.get(k,"")).strip():
+                return str(row.get(k)).strip()
+        return ""
 
-    city  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")).strip()
-    state = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")).strip()
-    zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code","Zip Code"]) or "", "")).strip()
-    if city or state or zipc:
-        if city and (state or zipc):
-            ship_lines.append(f"{city}, {_join_nonempty(state, zipc, sep=' ')}".strip(", "))
-        else:
-            ship_lines.append(_join_nonempty(city, state, zipc, sep=" "))
+    addr1 = _first_nonempty(arow, ["Address","Address 1","Address1","Street","Line1"])
+    if addr1: ship_lines.append(addr1)
+    addr2 = _first_nonempty(arow, ["Address 2","Address2","Line2","Street 2"])
+    if addr2: ship_lines.append(addr2)
 
-    c_name, c_email, c_phone = _match_user_contact(user_df, company, username, fallback_name=fallback_contact)
+    # City/State/Zip combined preferred ("City,Sate,Zip" exact header from your DB)
+    combined = ""
+    for cand in ["City,Sate,Zip","City,State,Zip","City_State_Zip","City State Zip","City, ST Zip"]:
+        if cand in arow.index and str(arow.get(cand,"")).strip():
+            combined = str(arow.get(cand)).strip()
+            break
+    if combined:
+        ship_lines.append(combined)
+    else:
+        city  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["City"]) or "", "")).strip()
+        state = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["State","ST"]) or "", "")).strip()
+        zipc  = str(arow.get(_pick_first_col(pd.DataFrame([arow]), ["Zip","ZIP","Postal","Postal Code"]) or "", "")).strip()
+        if city or state or zipc:
+            if city and (state or zipc):
+                ship_lines.append(f"{city}, {_join_nonempty(state, zipc, sep=' ')}".strip(', '))
+            else:
+                ship_lines.append(_join_nonempty(city, state, zipc, sep=' '))
+
+    # Append contact from user_contacts by username; if not found, use fallback_contact only as name
+    c_name, c_email, c_phone = _match_user_contact(user_df, printed_company, username)
+    if not c_name and fallback_contact:
+        c_name = fallback_contact
     if c_name:  ship_lines.append(c_name)
     if c_email: ship_lines.append(c_email)
-    if c_phone:
-        c_phone = re.sub(r'^\s*Phone:\s*', '', c_phone, flags=re.I)
-        ship_lines.append(f"Phone: {c_phone}")
+    if c_phone: ship_lines.append(f"Phone: {c_phone}")
 
     ship_txt = "\n".join([ln for ln in ship_lines if ln])
     return ship_txt, bill_txt
@@ -954,7 +1011,20 @@ else:
                     "Total":       ""
                 })
 
-                company_for_save = title_companies if title_companies else "(unknown)"
+                # Derive the Location from the cart rows (more reliable than using sidebar title)
+                company_for_save = None
+                if 'Company' in st.session_state[cart_key].columns:
+                    cart_companies = (
+                        st.session_state[cart_key]['Company']
+                        .dropna().astype(str).str.strip().unique().tolist()
+                    )
+                    if len(cart_companies) == 1:
+                        company_for_save = cart_companies[0]
+                    elif len(cart_companies) > 1:
+                        st.error('Cart has items from multiple Locations. Keep one location before generating.')
+                        st.stop()
+                if not company_for_save:
+                    company_for_save = title_companies if title_companies else '(unknown)'
                 ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact=str(name))
 
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
@@ -1195,3 +1265,4 @@ else:
                                                file_name=f"{qnum2}_{safe_name}.docx",
                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                                key=f"gen_dl_{rec['id']}")
+
