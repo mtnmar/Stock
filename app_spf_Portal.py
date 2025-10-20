@@ -27,6 +27,9 @@ from typing import Optional, List, Tuple, Dict
 from datetime import datetime, timezone
 
 import pandas as pd
+
+# Optional switch to bypass Parquet fast-path entirely (set env SPF_DISABLE_PARQUET=1)
+DISABLE_PARQUET = str(os.environ.get('SPF_DISABLE_PARQUET', '0')).lower() in {'1','true','yes','on'}
 import streamlit as st
 
 APP_VERSION = "2025.10.20"
@@ -162,7 +165,10 @@ def read_parquet_cached(path_str: str, sig: int) -> pd.DataFrame:
     return pd.read_parquet(path_str)
 
 def parquet_available_for(src: str, pq_paths: Dict[str, Optional[Path]]) -> Optional[Path]:
-    p = pq_paths.get(src); return p if p and p.exists() else None
+    if DISABLE_PARQUET:
+        return None
+    p = pq_paths.get(src)
+    return p if (p and p.exists() and p.is_file() and p.suffix.lower() in {'.parquet', '.pq'}) else None
 
 # ---------- SQLite helpers ----------
 def _db_sig(db_path: str) -> int:
@@ -609,7 +615,11 @@ else:
     def load_src(src: str):
         pq_path = parquet_available_for(src, pq_paths)
         if pq_path:
-            df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
+            try:
+                df_all = read_parquet_cached(str(pq_path), _filesig(pq_path))
+            except Exception as e:
+                st.warning(f"Parquet read failed for {pq_path.name} on '{src}': {e}. Falling back to SQLite.")
+                pq_path = None
             cols_in_db = list(df_all.columns)
             comp_col = "Company" if "Company" in df_all.columns else None
             all_companies = sorted({str(x) for x in df_all[comp_col].dropna().tolist()}) if comp_col else []
