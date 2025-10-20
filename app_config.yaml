@@ -1,3 +1,4 @@
+# app_config.yaml
 credentials:
   usernames:
     brad:
@@ -21,9 +22,14 @@ access:
     demo: ['*']
 
 settings:
-  db_path: "./maintainx_po.db"   # <— DB lives next to the app file
+  # DAILY source DB you overwrite:
+  db_path: "./maintainx_po.db"
 
-  # (remove or leave commented if you’re not using Parquet)
+  # PERSISTENT quotes DB (new file, lives in repo):
+  quotes_db_path: "./quotes.db"
+
+  # (remove if not used)
   # parquet:
   #   restock: ""
   #   po_outstanding: ""
+
