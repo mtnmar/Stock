@@ -1,4 +1,5 @@
-# app_config.yaml
+# app_config.yaml  (place beside app_spf_Portal.py in the repo root)
+
 credentials:
   usernames:
     brad:
@@ -11,24 +12,22 @@ credentials:
       password: "$2b$12$d9r3v4j3K2o2uI6dFoyVbOa3YV1Aq8p2qTj6kQy0iv8y2dQk6gV2W"
 
 cookie:
-  name: spf_po_portal          # keep your existing cookie name if you prefer
+  name: spf_po_portal
   key: change_me_in_yaml
   expiry_days: 7
 
 access:
   admin_usernames: [brad]
-  # Map usernames to allowed *Company* values. '*' means all companies.
   user_companies:
     brad: ['*']
     demo: ['*']
-    # example if you want to restrict:
-    # user1: ["Acme Co", "North Division"]
 
 settings:
-  # Leave blank to use default SQLite or Parquet auto-detect
-  db_path: ""
+  # <<< point explicitly to the DB that lives in this repo >>>
+  db_path: "./maintainx_po.db"
 
-  # OPTIONAL: hard-wire Parquet files (faster). Remove if you prefer env vars or auto-detect.
-  parquet:
-    restock: "/absolute/path/to/restock.parquet"
-    po_outstanding: "/absolute/path/to/po_outstanding.parquet"
+  # (optional) If you aren’t using Parquet, remove this block entirely.
+  # parquet:
+  #   restock: ""
+  #   po_outstanding: ""
+
