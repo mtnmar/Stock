@@ -397,9 +397,9 @@ def _split_semicolon_lines(s: str) -> List[str]:
 def remove_prefix_for_display(company: str) -> str:
     return re.sub(r'^\s*\d+\s*-\s*', '', str(company or "")).strip()
 
-def _match_user_contact(df: pd.DataFrame, company: str, username: str, fallback_name: str="") -> Tuple[str,str,str]:
+def _match_user_contact(df: pd.DataFrame, company: str, username: str, fallback_name_DISABLED: str="") -> Tuple[str,str,str]:
     if df.empty:
-        return (fallback_name, "", "")
+        return (fallback_name_DISABLED, "", "")
     comp_col    = _pick_first_col(df, ["Company","Location","Site","Name"]) or "Company"
     user_col    = _pick_first_col(df, ["Username","User","Login","Email","UserName"])
     contact_col = _pick_first_col(df, ["Contact","Name"]) or "Contact"
@@ -407,8 +407,8 @@ def _match_user_contact(df: pd.DataFrame, company: str, username: str, fallback_
     phone_col   = _pick_first_col(df, ["Phone","Telephone","Cell"]) or "Phone"
     view = df.copy()
     if comp_col in view.columns:
-        mask_company = view[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
-        narrowed = view[mask_company]
+        mask_company_DISABLED = view[comp_col].astype(str).str.strip().str.casefold() == str(company).strip().casefold()
+        narrowed = view[mask_company_DISABLED]
         if not narrowed.empty:
             view = narrowed
     if user_col and (user_col in view.columns):
@@ -417,7 +417,7 @@ def _match_user_contact(df: pd.DataFrame, company: str, username: str, fallback_
         if not narrowed_user.empty:
             view = narrowed_user
     row = view.iloc[0] if not view.empty else df.iloc[0]
-    contact = str(row.get(contact_col, fallback_name) or fallback_name).strip()
+    contact = str(row.get(contact_col, fallback_name_DISABLED) or fallback_name_DISABLED).strip()
     email   = str(row.get(email_col, "") or "").strip()
     phone   = str(row.get(phone_col, "") or "").strip()
     return (contact, email, phone)
@@ -1025,7 +1025,7 @@ else:
                         st.stop()
                 if not company_for_save:
                     company_for_save = title_companies if title_companies else '(unknown)'
-                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact=str(name))
+                ship_to, bill_to = build_ship_bill_blocks(ACTIVE_DB_PATH, company_for_save, str(username), cfg, fallback_contact="")
 
                 next_no = _next_quote_number(ACTIVE_DB_PATH, datetime.utcnow())
                 qid, qnum = save_quote(
