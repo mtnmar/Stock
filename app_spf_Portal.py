@@ -10,6 +10,7 @@
 # ✅ Ship To: from addresses (Location/Company) + user contact (user_contacts/User_Data/user_data)
 # ✅ RE-STOCK: requestor picker (user filter) before Generate
 # ✅ PRAGMA hardening for SQLite reliability
+# ✅ Unique Streamlit widget keys across tabs (fixes DuplicateElementId)
 #
 # requirements.txt (min):
 #   streamlit>=1.37
@@ -21,6 +22,7 @@
 #   pyyaml>=6.0
 #   requests>=2.31
 #   pyarrow>=17.0   # or fastparquet
+
 from __future__ import annotations
 import os, io, re, json, sqlite3, textwrap, hashlib
 from pathlib import Path
@@ -31,7 +33,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-QUOTES-SPLIT"
+APP_VERSION = "2025.10.20-QUOTES-SPLIT-KFIX"
 
 # ---- deps ----
 try:
@@ -633,9 +635,9 @@ else:
     st.sidebar.caption(f"Data DB (source): `{Path(DATA_DB_PATH).resolve()}`")
     st.sidebar.caption(f"Quotes DB: `{Path(QUOTES_DB_PATH).resolve()}`")
     st.sidebar.caption(f"Quotes in DB: **{quotes_count(QUOTES_DB_PATH)}**")
-    if st.sidebar.button("🔄 Refresh data"): st.cache_data.clear()
+    if st.sidebar.button("🔄 Refresh data", key="btn_refresh_data"): st.cache_data.clear()
 
-    page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0)
+    page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0, key="page_radio")
 
     # Loaders (for companies list)
     def load_src(src: str):
@@ -679,7 +681,7 @@ else:
     select_options = ["— Choose company —"]
     if is_admin and len(all_companies) > 1: select_options += [ADMIN_ALL]
     select_options += company_options
-    chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=0)
+    chosen = st.sidebar.selectbox("Choose your Company", options=select_options, index=0, key="company_select")
     if chosen == "— Choose company —":
         st.info("Select your Company on the left to load data."); st.stop()
     if is_admin and chosen == ADMIN_ALL:
@@ -702,7 +704,7 @@ else:
             if "Company" in df.columns:
                 df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
             label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
-            search = st.sidebar.text_input(label)
+            search = st.sidebar.text_input(label, key="restock_search_parquet")
             if search:
                 s = str(search); cols = ["Part Numbers","Name"] + ([vendor_col] if vendor_col else [])
                 ok = pd.Series(False, index=df.index)
@@ -716,7 +718,7 @@ else:
             cols_in_db = table_columns_in_order(DATA_DB_PATH, src)
             vendor_col = "Vendors" if "Vendors" in cols_in_db else ("Vendor" if "Vendor" in cols_in_db else None)
             label = 'Search Part Numbers / Name' + (' / Vendor' if vendor_col else '') + ' contains'
-            search = st.sidebar.text_input(label)
+            search = st.sidebar.text_input(label, key="restock_search_sqlite")
             ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
             if search:
                 if vendor_col:
@@ -751,8 +753,8 @@ else:
         with st.form(f"{grid_key}_form", clear_on_submit=False):
             edited = st.data_editor(df_display, use_container_width=True, hide_index=True, column_config=grid_col_cfg, key=grid_key)
             c_sp1, c_add, c_clear_sel, _ = st.columns([6,1,1,6])
-            add_clicked = c_add.form_submit_button("🛒 Add", use_container_width=True)
-            clear_sel_clicked = c_clear_sel.form_submit_button("🧹 Clear", use_container_width=True)
+            add_clicked = c_add.form_submit_button("🛒 Add", use_container_width=True, key="btn_add_cart")
+            clear_sel_clicked = c_clear_sel.form_submit_button("🧹 Clear", use_container_width=True, key="btn_clear_selection")
 
         try: selected_idx = edited.index[edited["Select"]==True]
         except Exception: selected_idx = []
@@ -802,7 +804,8 @@ else:
         with c1:
             st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(excel_df, sheet="RE_STOCK"),
                                file_name="RE_STOCK.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_restock_xlsx")
 
         # ---- Requestor picker (contact for Ship To) ----
         try:
@@ -869,13 +872,13 @@ else:
             left, right = st.columns([6,4])
             with left:
                 rcol, _ = st.columns([1,7])
-                remove_btn = rcol.form_submit_button("🗑️ Remove", use_container_width=True)
+                remove_btn = rcol.form_submit_button("🗑️ Remove", use_container_width=True, key="btn_remove_from_cart")
             with right:
                 c_clear, c_save, c_gen, c_email = st.columns([1,1,1,1])
-                clear_cart_btn = c_clear.form_submit_button("🧼 Clear", use_container_width=True, disabled=cart_df.empty)
-                save_qty = c_save.form_submit_button("💾 Save", use_container_width=True)
-                gen_clicked = c_gen.form_submit_button("🧾 Generate", use_container_width=True)
-                _ = c_email.form_submit_button("✉️ Email", use_container_width=True, disabled=True)
+                clear_cart_btn = c_clear.form_submit_button("🧼 Clear", use_container_width=True, disabled=cart_df.empty, key="btn_clear_cart")
+                save_qty = c_save.form_submit_button("💾 Save", use_container_width=True, key="btn_save_qty")
+                gen_clicked = c_gen.form_submit_button("🧾 Generate", use_container_width=True, key="btn_generate_quote")
+                _ = c_email.form_submit_button("✉️ Email", use_container_width=True, disabled=True, key="btn_email_disabled")
 
         if save_qty and "Qty" in edited_cart.columns:
             def norm_q(v):
@@ -969,7 +972,8 @@ else:
                     "Download Quote (Word)",
                     data=doc_bytes,
                     file_name=f"{qnum}_{sanitize_filename(company_for_save)}.docx",
-                    mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                    mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    key="dl_quote_word_restock"
                 )
 
     # ----------------- Outstanding POs -----------------
@@ -981,7 +985,7 @@ else:
             df = df_all.copy()
             if "Company" in df.columns:
                 df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
-            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
+            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains', key="po_search_parquet")
             if search:
                 s = str(search); cols = ["Purchase Order #","Vendor","Part Number","Line Name"]
                 ok = pd.Series(False, index=df.index)
@@ -996,7 +1000,7 @@ else:
                 else:
                     df = df.assign(_co=co).sort_values(["_co"]).drop(columns=["_co"])
         else:
-            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains')
+            search = st.sidebar.text_input('Search PO # / Vendor / Part / Line Name contains', key="po_search_sqlite")
             ph = ','.join(['?']*len(chosen_companies)); where = [f"[Company] IN ({ph})"]; params = list(chosen_companies)
             if search:
                 where.append("([Purchase Order #] LIKE ? OR [Vendor] LIKE ? OR [Part Number] LIKE ? OR [Line Name] LIKE ?)")
@@ -1009,12 +1013,13 @@ else:
         cols_for_download = [c for c in table_columns_in_order(DATA_DB_PATH, src) if (c in df.columns) and (c not in hide_set)]
         display_cols = [c for c in cols_for_download if c != "Company"]
         st.markdown(f"### Outstanding POs — {title_companies}")
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(df[display_cols], use_container_width=True, hide_index=True, key="po_table")
         c1, _, _ = st.columns([1,1,6])
         with c1:
             st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(df[display_cols], sheet="Outstanding_POs"),
                                file_name="Outstanding_POs.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_po_xlsx")
 
     # ----------------- Quotes (New / Browse-Edit) -----------------
     else:
@@ -1023,14 +1028,14 @@ else:
 
         # Quick refresh for this page only
         r1, r2 = st.columns([1,6])
-        if r1.button("🔄 Refresh quotes"):
+        if r1.button("🔄 Refresh quotes", key="btn_refresh_quotes"):
             st.cache_data.clear()
             st.rerun()
         r2.caption(f"DB: {Path(QUOTES_DB_PATH).resolve()} • Total: {quotes_count(QUOTES_DB_PATH)}")
 
         include_all = is_admin  # admins default to seeing all
         if is_admin:
-            include_all = st.toggle("Show all companies", value=True)
+            include_all = st.toggle("Show all companies", value=True, key="toggle_show_all_quotes")
 
         tab_new, tab_browse = st.tabs(["🆕 New Quote", "📁 Browse / Edit"])
 
@@ -1041,22 +1046,23 @@ else:
         # NEW QUOTE
         with tab_new:
             try_default_idx = company_options.index(chosen) if chosen in company_options else 0
-            company_new = st.selectbox("Location", options=company_options, index=try_default_idx)
+            company_new = st.selectbox("Location", options=company_options, index=try_default_idx, key="new_location_select")
             if vendor_names:
-                vendor = st.selectbox("Vendor", options=[""] + vendor_names, index=0)
+                vendor = st.selectbox("Vendor", options=[""] + vendor_names, index=0, key="new_vendor_select")
             else:
-                vendor = st.text_input("Vendor", value="")
+                vendor = st.text_input("Vendor", value="", key="new_vendor_text")
 
             if "new_quote_no" not in st.session_state:
                 st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
-            quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no, help="QR-YYYY-####")
+            quote_no = st.text_input("Quote #", value=st.session_state.new_quote_no,
+                                     help="QR-YYYY-####", key="new_quote_no_input")
 
             ship_to, bill_to = build_ship_bill_blocks(DATA_DB_PATH, company_new, str(username))
             c1, c2 = st.columns(2)
             with c1:
-                ship_to = st.text_area("Ship To Address", value=ship_to, height=120)
+                ship_to = st.text_area("Ship To Address", value=ship_to, height=120, key="new_ship_to")
             with c2:
-                bill_to = st.text_area("Bill To Address", value=bill_to, height=120)
+                bill_to = st.text_area("Bill To Address", value=bill_to, height=120, key="new_bill_to")
 
             initial_rows = [{"Part Number":"", "Description":"", "Quantity":"", "Price/Unit":"", "Total":""} for _ in range(15)]
             if "new_quote_rows" not in st.session_state:
@@ -1076,7 +1082,7 @@ else:
 
             c_left, c_sp, c_save, c_gen, c_email = st.columns([4,5,1,1,1])
             with c_save:
-                if st.button("Save", use_container_width=True):
+                if st.button("Save", use_container_width=True, key="btn_new_save"):
                     qid, qnum = save_quote_safe(QUOTES_DB_PATH,
                                            quote_number=(quote_no or None),
                                            company=company_new,
@@ -1086,7 +1092,7 @@ else:
                     st.success(f"Saved quote #{qid} ({qnum})")
                     st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
             with c_gen:
-                if st.button("Generate", use_container_width=True):
+                if st.button("Generate", use_container_width=True, key="btn_new_generate"):
                     qid, qnum = save_quote_safe(QUOTES_DB_PATH,
                                            quote_number=(quote_no or None),
                                            company=company_new,
@@ -1103,36 +1109,42 @@ else:
                     )
                     st.download_button("Download Quote (Word)", data=doc_bytes,
                                        file_name=f"{qnum}_{sanitize_filename(company_new)}.docx",
-                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       key="dl_quote_word_new")
                     st.session_state.new_quote_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
             with c_email:
-                st.button("Email", use_container_width=True, disabled=True)
+                st.button("Email", use_container_width=True, disabled=True, key="btn_new_email")
 
         # BROWSE / EDIT
         with tab_browse:
-            comp_filter = st.selectbox("Filter by Company", options=["(all)"] + company_options, index=0)
+            comp_filter = st.selectbox("Filter by Company", options=["(all)"] + company_options, index=0, key="browse_company_filter")
             dfq = list_quotes(QUOTES_DB_PATH,
                               company=(None if comp_filter=="(all)" else comp_filter),
                               include_all=(include_all or comp_filter=="(all)"))
             if dfq.empty:
                 st.info("No saved quotes yet.")
             else:
-                st.dataframe(dfq, hide_index=True, use_container_width=True)
+                st.dataframe(dfq, hide_index=True, use_container_width=True, key="browse_quotes_table")
                 qid = st.number_input("Quote ID to open",
                                       min_value=int(dfq["id"].min()),
                                       max_value=int(dfq["id"].max()),
-                                      value=int(dfq["id"].max()), step=1)
+                                      value=int(dfq["id"].max()), step=1,
+                                      key="browse_qid_input")
                 rec = load_quote(QUOTES_DB_PATH, int(qid))
                 if not rec:
                     st.warning("Quote not found.")
                 else:
-                    quote_no = st.text_input("Quote #", value=rec["quote_number"] or _next_quote_number(QUOTES_DB_PATH, datetime.utcnow()))
-                    vendor   = st.text_input("Vendor", value=rec["vendor"] or "")
+                    quote_no = st.text_input("Quote #",
+                                             value=rec["quote_number"] or _next_quote_number(QUOTES_DB_PATH, datetime.utcnow()),
+                                             key=f"browse_quote_no_{rec['id']}")
+                    vendor   = st.text_input("Vendor", value=rec["vendor"] or "", key=f"browse_vendor_{rec['id']}")
                     c1, c2 = st.columns(2)
                     with c1:
-                        ship_to = st.text_area("Ship To Address", value=rec["ship_to"] or "", height=120)
+                        ship_to = st.text_area("Ship To Address", value=rec["ship_to"] or "", height=120,
+                                               key=f"browse_ship_to_{rec['id']}")
                     with c2:
-                        bill_to = st.text_area("Bill To Address", value=rec["bill_to"] or "", height=120)
+                        bill_to = st.text_area("Bill To Address", value=rec["bill_to"] or "", height=120,
+                                               key=f"browse_bill_to_{rec['id']}")
 
                     edited_exist = st.data_editor(
                         rec["lines"],
@@ -1176,8 +1188,8 @@ else:
                                                file_name=f"{qnum2}_{sanitize_filename(rec['company'])}.docx",
                                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                                key=f"gen_dl_{rec['id']}")
-
                     with c_email:
-                        st.button("Email", use_container_width=True, disabled=True)
+                        st.button("Email", use_container_width=True, disabled=True, key=f"btn_browse_email_{rec['id']}")
+
 
 
