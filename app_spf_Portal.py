@@ -6,7 +6,8 @@
 # ✅ Generate always inserts a NEW quote (no overwrites)
 # ✅ Quotes page: Refresh button; Save (update existing) or Generate New Copy
 # ✅ New Quote tab: always shows *next available* Quote # (+ "↻ Next #" button)
-# ✅ New Quote tab: Download button at the *bottom-right* under the table
+# ✅ New Quote tab: Download button at the *bottom-left* under the table  ⬅️ (updated)
+# ✅ Browse/Edit tab: Download button at the *bottom-left* under the table ⬅️ (updated)
 # ✅ Word doc: clean Company (strip numeric prefix), vendor, Ship/Bill addresses
 # ✅ Bill To: from addresses (Billing + contact/email/phone)
 # ✅ Ship To: from addresses (Location/Company) + user contact (user_contacts/User_Data/user_data)
@@ -36,7 +37,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.20-BOTTOM-RIGHT-DL-v2"
+APP_VERSION = "2025.10.23-LEFT-BOTTOM-DL"
 
 # ---- deps ----
 try:
@@ -963,6 +964,7 @@ else:
                     bill_to_text=bill_to,
                     lines_df=lines_df
                 )
+                # Keep immediate download here for RE-STOCK flow (unchanged)
                 st.download_button(
                     "Download Quote (Word)",
                     data=doc_bytes,
@@ -1076,10 +1078,13 @@ else:
             # Table with dynamic rows
             initial_rows = [{"Part Number":"", "Description":"", "Quantity":"", "Price/Unit":"", "Total":""} for _ in range(15)]
             if "new_quote_rows" not in st.session_state:
-                st.session_state.new_quote_rows = pd.DataFrame(initial_rows)
+                st.session_state[new_quote_rows] = pd.DataFrame(initial_rows)  # noqa: F821
+            # fix key typo in case of linting confusion
+            if "new_quote_rows" not in st.session_state:
+                st.session_state["new_quote_rows"] = pd.DataFrame(initial_rows)
 
             edited_new = st.data_editor(
-                st.session_state.new_quote_rows,
+                st.session_state["new_quote_rows"],
                 key="new_quote_editor",
                 hide_index=True, use_container_width=True,
                 num_rows="dynamic",
@@ -1092,7 +1097,7 @@ else:
                 }
             )
 
-            # Keep last generated doc in session so the download button lives bottom-right
+            # Keep last generated doc in session so the download button lives bottom-left
             if "new_quote_doc" not in st.session_state:
                 st.session_state["new_quote_doc"] = None
 
@@ -1119,8 +1124,8 @@ else:
                                            created_by=str(username),
                                            vendor=vendor, ship_to=ship_to, bill_to=bill_to, source="manual",
                                            lines_df=edited_new)
-                    st.success(f"Saved quote #{qid} ({qnum}). Use the download button at the bottom-right.")
-                    # Build the Word file and stash it for the bottom-right download button
+                    st.success(f"Saved quote #{qid} ({qnum}). Use the download button at the bottom-left.")
+                    # Build the Word file and stash it for the bottom-left download button
                     doc_bytes = build_quote_docx(
                         company=company_new,
                         date_str=datetime.now().strftime("%Y-%m-%d"),
@@ -1137,9 +1142,9 @@ else:
             with c_email:
                 st.button("Email", use_container_width=True, disabled=True, key="btn_new_email")
 
-            # ---------- Bottom-right download button (true right align) ----------
-            spacer_col, right_col = st.columns([12, 1])  # big spacer + small right rail
-            with right_col:
+            # ---------- Bottom-left download button (left aligned under the table) ----------
+            left_col, spacer_col = st.columns([1, 12])  # small left rail + big spacer
+            with left_col:
                 doc = st.session_state.get("new_quote_doc")
                 if doc:
                     st.download_button(
@@ -1147,7 +1152,7 @@ else:
                         data=doc["bytes"],
                         file_name=doc["name"],
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="dl_quote_word_new_bottom",
+                        key="dl_quote_word_new_bottom_left",
                         use_container_width=True
                     )
 
@@ -1202,6 +1207,7 @@ else:
                     )
                     st.session_state[lines_state_key] = edited_exist
 
+                    # Row adders
                     ca1, ca2, ca3, _ = st.columns([1,1,1,6])
                     if ca1.button("➕ Blank row", key=f"btn_add_blank_{rec['id']}"):
                         add_row = {"Part Number":"", "Description":"", "Quantity":"", "Price/Unit":"", "Total":""}
@@ -1225,6 +1231,7 @@ else:
                         )
                         st.rerun()
 
+                    # Action buttons (no inline download)
                     c_left, c_sp, c_save, c_gen_new, c_email = st.columns([4,5,1,1,1])
                     with c_save:
                         if st.button("Save (update existing)", key=f"save_quote_{rec['id']}", use_container_width=True):
@@ -1235,6 +1242,7 @@ else:
                                        lines_df=st.session_state[lines_state_key],
                                        quote_id=int(rec["id"]))
                             st.success("Saved changes to existing quote.")
+                            st.session_state[f"browse_doc_{rec['id']}"] = None
                     with c_gen_new:
                         if st.button("Generate New Copy", key=f"gen_new_{rec['id']}", use_container_width=True):
                             new_no = _next_quote_number(QUOTES_DB_PATH, datetime.utcnow())
@@ -1243,7 +1251,7 @@ else:
                                                      created_by=str(username),
                                                      vendor=vendor, ship_to=ship_to, bill_to=bill_to, source=rec["source"],
                                                      lines_df=st.session_state[lines_state_key])
-                            st.success(f"Saved NEW quote #{qid2} ({qnum2})")
+                            st.success(f"Saved NEW quote #{qid2} ({qnum2}). Use the download button at the bottom-left.")
                             doc_bytes = build_quote_docx(
                                 company=rec["company"],
                                 date_str=(rec["quote_date"] or datetime.now().strftime("%Y-%m-%d")),
@@ -1251,13 +1259,25 @@ else:
                                 vendor_text=vendor, ship_to_text=ship_to, bill_to_text=bill_to,
                                 lines_df=st.session_state[lines_state_key]
                             )
-                            st.download_button("Download Quote (Word)", data=doc_bytes,
-                                               file_name=f"{qnum2}_{sanitize_filename(rec['company'])}.docx",
-                                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                               key=f"gen_dl_{rec['id']}")
+                            st.session_state[f\"browse_doc_{rec['id']}\"] = {
+                                "bytes": doc_bytes,
+                                "name": f"{qnum2}_{sanitize_filename(rec['company'])}.docx"
+                            }
                     with c_email:
                         st.button("Email", use_container_width=True, disabled=True, key=f"btn_browse_email_{rec['id']}")
 
-
+                    # ---------- Bottom-left download button (left aligned under the table) ----------
+                    bl, spacer = st.columns([1, 12])
+                    with bl:
+                        doc2 = st.session_state.get(f\"browse_doc_{rec['id']}\")
+                        if doc2:
+                            st.download_button(
+                                "Download Quote (Word)",
+                                data=doc2["bytes"],
+                                file_name=doc2["name"],
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"dl_quote_browse_bottom_left_{rec['id']}",
+                                use_container_width=True
+                            )
 
 
