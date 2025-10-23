@@ -37,7 +37,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.23-LEFT-BOTTOM-DL"
+APP_VERSION = "2025.10.23-LEFT-BOTTOM-DL-FIX1"
 
 # ---- deps ----
 try:
@@ -119,7 +119,7 @@ def download_db_from_github(*, repo: str, path: str, branch: str='main', token: 
     headers = {"Accept": "application/vnd.github.v3.raw"}
     if token: headers["Authorization"] = f"token {token}"
     r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code != 200: raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
+    if r.status_code != 200: raise RuntimeError(f"GitHub API returned {status}: {text}")  # intentionally simple
     tmpdir = Path(tempfile.gettempdir()) / "spf_po_cache"; tmpdir.mkdir(parents=True, exist_ok=True)
     out = tmpdir / DEFAULT_DB
     if not out.exists() or out.stat().st_size == 0:
@@ -772,19 +772,20 @@ else:
                 diff = (m - s).clip(lower=0); return diff.apply(lambda x: "" if pd.isna(x) else str(int(float(x))) if float(x).is_integer() else str(x))
             add_df["__QTY__"] = compute_qty_min_minus_stock(add_df)
 
-            if vendor_col:
-                sel_vendors = sorted(set(add_df[vendor_col].dropna().astype(str).str.strip()))
+            vendor_col_local = vendor_col
+            if vendor_col_local:
+                sel_vendors = sorted(set(add_df[vendor_col_local].dropna().astype(str).str.strip()))
                 cart_df = st.session_state[cart_key]
-                cart_vendors = sorted(set(cart_df[vendor_col].dropna().astype(str).str.strip())) if (not cart_df.empty and vendor_col in cart_df.columns) else []
+                cart_vendors = sorted(set(cart_df[vendor_col_local].dropna().astype(str).str.strip())) if (not cart_df.empty and vendor_col_local in cart_df.columns) else []
                 if not cart_vendors:
                     if len(sel_vendors) > 1:
                         chosen_vendor = sel_vendors[0]
-                        add_df = add_df[add_df[vendor_col].astype(str).str.strip()==chosen_vendor]
+                        add_df = add_df[add_df[vendor_col_local].astype(str).str.strip()==chosen_vendor]
                         st.info(f"Cart is per-vendor. Added only Vendor '{chosen_vendor}'.")
                 else:
                     chosen_vendor = cart_vendors[0]
                     before = len(add_df)
-                    add_df = add_df[add_df[vendor_col].astype(str).str.strip()==chosen_vendor]
+                    add_df = add_df[add_df[vendor_col_local].astype(str).str.strip()==chosen_vendor]
                     skipped = before - len(add_df)
                     if skipped>0: st.warning(f"Cart locked to Vendor '{chosen_vendor}'. Skipped {skipped} item(s).")
             merged = pd.concat([st.session_state[cart_key], add_df], ignore_index=True)
@@ -969,7 +970,7 @@ else:
                     "Download Quote (Word)",
                     data=doc_bytes,
                     file_name=f"{qnum}_{sanitize_filename(company_for_save)}.docx",
-                    mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key="dl_quote_word_restock"
                 )
 
@@ -1077,9 +1078,6 @@ else:
 
             # Table with dynamic rows
             initial_rows = [{"Part Number":"", "Description":"", "Quantity":"", "Price/Unit":"", "Total":""} for _ in range(15)]
-            if "new_quote_rows" not in st.session_state:
-                st.session_state[new_quote_rows] = pd.DataFrame(initial_rows)  # noqa: F821
-            # fix key typo in case of linting confusion
             if "new_quote_rows" not in st.session_state:
                 st.session_state["new_quote_rows"] = pd.DataFrame(initial_rows)
 
@@ -1259,7 +1257,7 @@ else:
                                 vendor_text=vendor, ship_to_text=ship_to, bill_to_text=bill_to,
                                 lines_df=st.session_state[lines_state_key]
                             )
-                            st.session_state[f\"browse_doc_{rec['id']}\"] = {
+                            st.session_state[f"browse_doc_{rec['id']}"] = {
                                 "bytes": doc_bytes,
                                 "name": f"{qnum2}_{sanitize_filename(rec['company'])}.docx"
                             }
@@ -1269,7 +1267,7 @@ else:
                     # ---------- Bottom-left download button (left aligned under the table) ----------
                     bl, spacer = st.columns([1, 12])
                     with bl:
-                        doc2 = st.session_state.get(f\"browse_doc_{rec['id']}\")
+                        doc2 = st.session_state.get(f"browse_doc_{rec['id']}")
                         if doc2:
                             st.download_button(
                                 "Download Quote (Word)",
@@ -1279,5 +1277,4 @@ else:
                                 key=f"dl_quote_browse_bottom_left_{rec['id']}",
                                 use_container_width=True
                             )
-
 
