@@ -1140,18 +1140,17 @@ else:
             with c_email:
                 st.button("Email", use_container_width=True, disabled=True, key="btn_new_email")
 
-            # ---------- Bottom-left download button (left aligned under the table) ----------
-            left_col, spacer_col = st.columns([1, 12])  # small left rail + big spacer
-            with left_col:
+            # Inline bottom-left download (same action row)
+            with c_left:
                 doc = st.session_state.get("new_quote_doc")
                 if doc:
                     st.download_button(
-                        "Download Quote (Word)",
-                        data=doc["bytes"],
-                        file_name=doc["name"],
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="dl_quote_word_new_bottom_left",
-                        use_container_width=True
+                    "Download Quote (Word)",
+                    data=doc["bytes"],
+                    file_name=doc["name"],
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_quote_word_new_inline",
+                    use_container_width=True
                     )
 
         # ===== BROWSE / EDIT =====
@@ -1230,7 +1229,7 @@ else:
                         st.rerun()
 
                     # Action buttons (no inline download)
-                    c_left, c_sp, c_save, c_gen_new, c_email = st.columns([4,5,1,1,1])
+                    c_left, c_sp, c_save, c_gen_new, c_email = st.columns([2,6,1,1,1])
                     with c_save:
                         if st.button("Save (update existing)", key=f"save_quote_{rec['id']}", use_container_width=True):
                             save_quote(QUOTES_DB_PATH, quote_number=quote_no or None,
@@ -1264,9 +1263,8 @@ else:
                     with c_email:
                         st.button("Email", use_container_width=True, disabled=True, key=f"btn_browse_email_{rec['id']}")
 
-                    # ---------- Bottom-left download button (left aligned under the table) ----------
-                    bl, spacer = st.columns([1, 12])
-                    with bl:
+                    # Inline download (same action row, left column)
+                    with c_left:
                         doc2 = st.session_state.get(f"browse_doc_{rec['id']}")
                         if doc2:
                             st.download_button(
@@ -1274,7 +1272,8 @@ else:
                                 data=doc2["bytes"],
                                 file_name=doc2["name"],
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                key=f"dl_quote_browse_bottom_left_{rec['id']}",
+                                key=f"dl_quote_browse_inline_{rec['id']}",
                                 use_container_width=True
                             )
+
 
