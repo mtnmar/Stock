@@ -1,36 +1,46 @@
-# app_spf_Portal.py — refresh-safe DB selector (GitHub vs local) + recency banner
+# app_spf_Portal.py — login restored + sidebar layout + fresh DB handling
 # ---------------------------------------------------------------------------------
-# What’s new
-# - Prefers GitHub download when configured; YAML/ENV/local path otherwise
-# - Sidebar shows DB path + OS file last-modified timestamp
-# - "Re-download from GitHub (force)" fetches a fresh copy to a NEW temp path
-# - Manual local DB picker (absolute path) with "Use this DB" button
-# - Cache keys include the DB file signature + a manual nonce you can bump
-# - "Recency Check" panel: max date detected in each table (restock, po_outstanding)
+# Restores:
+#   • streamlit-authenticator login (user-specific Location access via config)
+#   • All nav + controls in the **sidebar** (not top)
+#   • "Data last updated" (file mtime) + "Recency Check" in sidebar
+#   • Clear cache + Force re-download from GitHub + manual local DB path override
+#   • Cache keys include DB signature + a manual nonce for guaranteed refresh
 #
-# Minimal deps:
-#   streamlit>=1.27
-#   pandas>=2.0
-#   requests>=2.31     # only if you use the GitHub fetch button
-#   xlsxwriter>=3.2    # for Excel downloads
+# Keep your previous app_config.yaml / Streamlit secrets layout:
+#   [app_config]
+#   settings.db_path = "C:/path/to/maintainx_po.db"
+#   settings.quotes_db_path = "C:/path/to/quotes.db"
+#   access.admin_usernames = ["brad"]
+#   access.user_companies.brad = ["110 - Deckers Creek Limestone","300 - Greer Lime - Stone"] # or ["*"]
+#   cookie.name = "spf_po_portal"
+#   cookie.key = "change_me"
+#   cookie.expiry_days = 7
+#   credentials.usernames.brad.name = "Brad"
+#   credentials.usernames.brad.email = "brad@example.com"
+#   credentials.usernames.brad.password = "$2b$12$hashed_bcrypt_here"
 #
-# Optional:
-#   python-docx>=1.1   # to build Word quote requests (kept simple here)
+# Optional GitHub (for "Re-download"):
+#   [github]
+#   repo = "YOURUSER/YOURREPO"
+#   path = "maintainx_po.db"
+#   branch = "main"
+#   token = "ghp_..."     # only if private
 # ---------------------------------------------------------------------------------
 
 from __future__ import annotations
 
-import os, io, json, sqlite3, hashlib, tempfile, time, re
+import os, io, re, json, sqlite3, hashlib, tempfile, time
 from pathlib import Path
-from typing import Tuple, List, Dict, Optional
+from typing import Optional, Tuple, List, Dict
 from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "2025.10.28-refresh-safe"
+APP_VERSION = "2025.10.28-login+sidebar-fix"
 
-# Optional Word export
+# ---------------- Optional Word export ----------------
 DOCX_OK = True
 try:
     from docx import Document
@@ -38,13 +48,21 @@ try:
 except Exception:
     DOCX_OK = False
 
+# ---------------- Auth (streamlit-authenticator) ----------------
+AUTH_OK = True
+try:
+    import yaml
+    import streamlit_authenticator as stauth
+except Exception:
+    AUTH_OK = False
+
 st.set_page_config(page_title="SPF PO Portal", page_icon="📦", layout="wide")
 
 DEFAULT_DB = "maintainx_po.db"
 QUOTES_DB  = "quotes.db"
 HERE = Path(__file__).resolve().parent
 
-# ---------------- Utils ----------------
+# ========================= Utilities =========================
 
 def _filesig(p: Path) -> int:
     """Compact signature from mtime_ns and file size."""
@@ -153,7 +171,7 @@ def build_quote_docx(company: str, date_str: str, quote_number: str,
 
     bio = io.BytesIO(); doc.save(bio); bio.seek(0); return bio.getvalue()
 
-# ---------------- Config + source selection ----------------
+# ========================= Config + Source =========================
 
 def cfg_plain(obj):
     if isinstance(obj, dict): return {k: cfg_plain(v) for k,v in obj.items()}
@@ -168,7 +186,6 @@ def load_config() -> dict:
     cfg_file = HERE / "app_config.yaml"
     if cfg_file.exists():
         try:
-            import yaml
             return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
         except Exception as e:
             st.error(f"Invalid YAML in app_config.yaml: {e}")
@@ -176,6 +193,9 @@ def load_config() -> dict:
     return {
         "settings": {"db_path": str((HERE/DEFAULT_DB).resolve()),
                      "quotes_db_path": str((HERE/QUOTES_DB).resolve())},
+        "access": {"admin_usernames": ["demo"], "user_companies": {"demo": ["*"]}},
+        "cookie": {"name": "spf_po_portal", "key": "change_me", "expiry_days": 7},
+        "credentials": {"usernames": {"demo": {"name": "Demo", "email": "demo@example.com", "password": ""}}}
     }
 
 def get_github_cfg() -> Optional[Dict[str,str]]:
@@ -195,20 +215,20 @@ def download_db_from_github(repo: str, path: str, branch: str='main', token: Opt
         raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
     tmpdir = Path(tempfile.gettempdir()) / "spf_po_cache"
     tmpdir.mkdir(parents=True, exist_ok=True)
-    # write to a NEW, timestamped file so we don't reuse the 10/24 tmp
+    # write to a NEW, timestamped path to avoid stale cache reuse
     out = tmpdir / f"{int(time.time())}_{DEFAULT_DB}"
     out.write_bytes(r.content)
-    # touch mtime so caches definitely see a change
+    # touch mtime
     now = time.time()
     os.utime(out, (now, now))
     return str(out.resolve())
 
 def resolve_db_path(cfg: dict) -> str:
-    # 1) manual override from UI
+    # manual override from UI
     if st.session_state.get("MANUAL_DB_PATH") and Path(st.session_state["MANUAL_DB_PATH"]).exists():
         return st.session_state["MANUAL_DB_PATH"]
 
-    # 2) prefer GitHub if configured
+    # prefer GitHub if configured
     gh = get_github_cfg()
     if gh:
         try:
@@ -218,17 +238,17 @@ def resolve_db_path(cfg: dict) -> str:
         except Exception as e:
             st.warning(f"GitHub fetch failed, falling back to local/YAML. Error: {e}")
 
-    # 3) YAML / local path
+    # YAML / local path
     yaml_db = (cfg or {}).get("settings",{}).get("db_path")
     if yaml_db:
         return str(Path(yaml_db).expanduser().resolve())
 
-    # 4) env var
+    # env var
     env_db = os.environ.get("SPF_DB_PATH")
     if env_db:
         return str(Path(env_db).expanduser().resolve())
 
-    # 5) default
+    # default
     return str((HERE/DEFAULT_DB).resolve())
 
 def resolve_quotes_db_path(cfg: dict) -> str:
@@ -238,9 +258,10 @@ def resolve_quotes_db_path(cfg: dict) -> str:
     if env_q: return str(Path(env_q).expanduser().resolve())
     return str((HERE / QUOTES_DB).resolve())
 
-# ---------------- Boot ----------------
+# ========================= Boot + Auth =========================
 
-cfg = load_config(); cfg = cfg_plain(cfg)
+cfg = load_config()
+
 if "CACHE_NONCE" not in st.session_state: st.session_state["CACHE_NONCE"] = 0
 if "DATA_DB_PATH" not in st.session_state: st.session_state["DATA_DB_PATH"] = resolve_db_path(cfg)
 if "QUOTES_DB_PATH" not in st.session_state: st.session_state["QUOTES_DB_PATH"] = resolve_quotes_db_path(cfg)
@@ -248,7 +269,31 @@ if "QUOTES_DB_PATH" not in st.session_state: st.session_state["QUOTES_DB_PATH"] 
 DATA_DB_PATH   = st.session_state["DATA_DB_PATH"]
 QUOTES_DB_PATH = st.session_state["QUOTES_DB_PATH"]
 
-# Sidebar: DB info + controls
+# ---- Auth UI ----
+if AUTH_OK:
+    cookie_cfg = cfg.get('cookie', {})
+    authenticator = stauth.Authenticate(
+        cfg.get('credentials', {}),
+        cookie_cfg.get('name', 'spf_po_portal'),
+        cookie_cfg.get('key',  'change_me'),
+        cookie_cfg.get('expiry_days', 7),
+    )
+    name, auth_status, username = authenticator.login("Login", "main")
+else:
+    name, auth_status, username = ("Demo", True, "demo")
+
+if auth_status is False:
+    st.error("Username/password is incorrect")
+    st.stop()
+elif auth_status is None:
+    st.info("Please log in.")
+    st.stop()
+
+# ---- Sidebar (layout restored here) ----
+if AUTH_OK:
+    authenticator.logout('Logout', 'sidebar')
+st.sidebar.success(f"Logged in as {name}")
+
 def db_info_caption(path: str) -> str:
     try:
         p = Path(path)
@@ -262,11 +307,11 @@ st.sidebar.caption(db_info_caption(DATA_DB_PATH))
 st.sidebar.caption(f"Quotes DB: `{Path(QUOTES_DB_PATH).resolve()}`")
 
 c1, c2 = st.sidebar.columns(2)
-if c1.button("🔄 Clear cache", use_container_width=True):
+if c1.button("🔄 Clear cache", use_container_width=True, key="btn_clear_cache"):
     st.cache_data.clear()
     st.session_state["CACHE_NONCE"] += 1
     st.rerun()
-if c2.button("🕸️ Re-download (GitHub)", use_container_width=True):
+if c2.button("🕸️ Re-download", use_container_width=True, key="btn_redownload"):
     gh = get_github_cfg()
     if gh:
         try:
@@ -284,8 +329,8 @@ if c2.button("🕸️ Re-download (GitHub)", use_container_width=True):
         st.sidebar.warning("GitHub secrets not configured.")
 
 st.sidebar.markdown("---")
-manual = st.sidebar.text_input("Local DB path (absolute)", value="")
-if st.sidebar.button("Use this DB", use_container_width=True):
+manual = st.sidebar.text_input("Local DB path (absolute)", value="", key="manual_db_path")
+if st.sidebar.button("Use this DB", use_container_width=True, key="btn_use_local"):
     if manual and Path(manual).exists():
         st.session_state["MANUAL_DB_PATH"] = str(Path(manual).resolve())
         st.session_state["DATA_DB_PATH"]   = st.session_state["MANUAL_DB_PATH"]
@@ -295,14 +340,7 @@ if st.sidebar.button("Use this DB", use_container_width=True):
     else:
         st.sidebar.error("Path not found.")
 
-# Header with version + db timestamp
-try:
-    db_ts = datetime.fromtimestamp(Path(DATA_DB_PATH).stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-except Exception:
-    db_ts = "(unknown)"
-st.markdown(f"## SPF PO Portal  \n**Data last updated (file mtime):** {db_ts}  \n_Version {APP_VERSION}_")
-
-# Quick recency check (max date in each known table)
+# Recency check (sidebar)
 def max_date_from(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if c in df.columns:
@@ -315,120 +353,179 @@ rec_cols = {
     "restock": ["Part Updated on","Last Updated","Posting Date","Approved On","Completed On","Created On","Needed By"],
     "po_outstanding": ["Created On","Approved On","Completed On","Posting Date"],
 }
-
-with st.expander("Recency Check (max dates detected)"):
+with st.sidebar.expander("Recency Check (max dates)"):
     for table, cols in rec_cols.items():
         try:
             df = q(f"SELECT * FROM [{table}]", db_path=DATA_DB_PATH)
             when = max_date_from(df, cols)
-            st.write(f"- **{table}**: {when or '(no date columns present)'}")
+            st.write(f"- **{table}**: {when or '(no date columns)'}")
         except Exception as e:
             st.write(f"- **{table}**: not available ({e})")
 
-# Page selection
-page = st.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], horizontal=True, key="page_radio")
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Version {APP_VERSION}")
 
-def visible_cols(df: pd.DataFrame, extra_hide: set[str] | None = None) -> list[str]:
-    hide = {"ID","id","Purchase Order ID","__KEY__"} | (extra_hide or set())
-    return [c for c in df.columns if c not in hide]
+# ========================= Access control: Locations =========================
 
-# Companies list from RE-STOCK
-def company_list() -> List[str]:
+# Collect companies from data
+def all_companies() -> List[str]:
     try:
         df = q("SELECT DISTINCT [Company] FROM [restock] WHERE [Company] IS NOT NULL ORDER BY 1", db_path=DATA_DB_PATH)
         return [str(x) for x in df["Company"].dropna().tolist()]
     except Exception:
         return []
 
-company_options = company_list() or ["(none)"]
-chosen_company = st.selectbox("Location", options=company_options, index=0, key="company_select_main")
+all_companies_list = all_companies()
 
-# --------------------- RE-STOCK ---------------------
-if page == "RE-STOCK":
+# Map allowed companies by user
+username_ci = str(username).casefold()
+admin_users_ci = {str(u).casefold() for u in (cfg.get('access', {}).get('admin_usernames', []) or [])}
+is_admin = username_ci in admin_users_ci
+uc_raw = (cfg.get('access', {}).get('user_companies', {}) or {})
+uc_ci_map = {str(k).casefold(): v for k, v in uc_raw.items()}
+allowed_cfg = uc_ci_map.get(username_ci, [])
+if isinstance(allowed_cfg, str): allowed_cfg = [allowed_cfg]
+allowed_cfg = [a for a in (allowed_cfg or [])]
+
+def norm(s: str) -> str: return " ".join(str(s).strip().split()).casefold()
+db_map = {norm(c): c for c in all_companies_list}
+allowed_norm = {norm(a) for a in allowed_cfg}
+star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
+
+if is_admin or star_granted:
+    allowed_set = set(all_companies_list or [])
+else:
+    matches = {db_map[n] for n in allowed_norm if n in db_map}
+    allowed_set = matches if matches else set(allowed_cfg)
+
+if not allowed_set:
+    st.error("No companies configured for your account. Ask an admin to update your access.")
+    with st.expander("Company values present in data"):
+        st.write(sorted(all_companies_list))
+    st.stop()
+
+company_options = sorted(allowed_set)
+ADMIN_ALL = "« All companies (admin) »"
+select_options = ["— Choose company —"]
+if is_admin and len(all_companies_list) > 1: select_options += [ADMIN_ALL]
+select_options += company_options
+
+chosen_company = st.sidebar.selectbox("Choose your Location", options=select_options, index=0, key="company_select")
+
+if chosen_company == "— Choose company —":
+    st.info("Select your Location from the left sidebar.")
+    st.stop()
+
+if is_admin and chosen_company == ADMIN_ALL:
+    chosen_companies = sorted(all_companies_list)
+    title_companies = "All companies (admin)"
+else:
+    chosen_companies = [chosen_company]
+    title_companies = chosen_company
+
+# ========================= Page nav (sidebar) =========================
+
+page = st.sidebar.radio("Page", ["RE-STOCK", "Outstanding POs", "Quotes"], index=0, key="page_radio")
+
+# ========================= RE-STOCK =========================
+
+def restock_page():
+    st.markdown(f"### RE-STOCK — {title_companies}")
     try:
         df_all = q("SELECT * FROM [restock]", db_path=DATA_DB_PATH)
     except Exception as e:
         st.error(f"Could not read [restock]: {e}")
-        df_all = pd.DataFrame()
+        return
 
     if df_all.empty:
         st.info("No RE-STOCK data found.")
-    else:
-        df = df_all.copy()
-        if "Company" in df.columns and chosen_company and chosen_company != "(none)":
-            df = df[df["Company"].astype(str).str.strip() == str(chosen_company).strip()]
+        return
 
-        s = st.text_input("Search Part Numbers / Name / Vendor contains", key="restock_search")
-        if s:
-            cols = [c for c in ["Part Numbers","Name","Vendor","Vendors"] if c in df.columns]
-            if cols:
-                m = pd.Series(False, index=df.index)
-                for c in cols:
-                    m |= df[c].astype(str).str.contains(s, case=False, na=False)
-                df = df[m]
+    df = df_all.copy()
+    if "Company" in df.columns and chosen_companies:
+        df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
 
-        df = attach_row_key(df)
-        df_disp = df[visible_cols(df, {"__QTY__"})].copy()
-        st.dataframe(df_disp, use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Download view (.xlsx)",
-            data=to_xlsx_bytes(df_disp, sheet="RE_STOCK"),
-            file_name=f"RE_STOCK_{chosen_company or 'all'}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_restock_xlsx"
-        )
+    # Search in sidebar to keep top area clean
+    s = st.sidebar.text_input("Search PN / Name / Vendor contains", key="restock_search")
+    if s:
+        cols = [c for c in ["Part Numbers","Name","Vendor","Vendors"] if c in df.columns]
+        if cols:
+            m = pd.Series(False, index=df.index)
+            for c in cols:
+                m |= df[c].astype(str).str.contains(s, case=False, na=False)
+            df = df[m]
 
-# ----------------- Outstanding POs -----------------
-elif page == "Outstanding POs":
+    df = attach_row_key(df)
+    df_disp = df[[c for c in df.columns if c not in {"__KEY__","ID","id","Purchase Order ID"}]].copy()
+    st.dataframe(df_disp, use_container_width=True, hide_index=True, key="restock_table")
+
+    st.download_button(
+        "⬇️ Download view (.xlsx)",
+        data=to_xlsx_bytes(df_disp, sheet="RE_STOCK"),
+        file_name=f"RE_STOCK_{(title_companies or 'all').replace(' ','_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_restock_xlsx"
+    )
+
+# ========================= Outstanding POs =========================
+
+def po_outstanding_page():
+    st.markdown(f"### Outstanding POs — {title_companies}")
     try:
         df_all = q("SELECT * FROM [po_outstanding]", db_path=DATA_DB_PATH)
     except Exception as e:
         st.error(f"Could not read [po_outstanding]: {e}")
-        df_all = pd.DataFrame()
+        return
 
     if df_all.empty:
-        st.info("No Outstanding POs data found.")
-    else:
-        df = df_all.copy()
-        if "Company" in df.columns and chosen_company and chosen_company != "(none)":
-            df = df[df["Company"].astype(str).str.strip() == str(chosen_company).strip()]
-        s = st.text_input("Search PO # / Vendor / Part / Line contains", key="po_search")
-        if s:
-            cols = [c for c in ["Purchase Order #","Vendor","Part Number","Line Name"] if c in df.columns]
-            if cols:
-                m = pd.Series(False, index=df.index)
-                for c in cols:
-                    m |= df[c].astype(str).str.contains(s, case=False, na=False)
-                df = df[m]
-        df = attach_row_key(df)
-        df_disp = df[visible_cols(df)].copy()
-        st.dataframe(df_disp, use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Download view (.xlsx)",
-            data=to_xlsx_bytes(df_disp, sheet="Outstanding_POs"),
-            file_name=f"Outstanding_POs_{chosen_company or 'all'}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_po_xlsx"
-        )
+        st.info("No Outstanding POs data found."); return
 
-# ----------------------- Quotes -----------------------
-else:
-    # tiny quotes section just to keep parity
-    def next_quote_number(db_path: str, date_obj: datetime) -> str:
-        with sqlite3.connect(db_path, timeout=30, check_same_thread=False) as conn:
+    df = df_all.copy()
+    if "Company" in df.columns and chosen_companies:
+        df = df[df["Company"].astype(str).isin([str(x) for x in chosen_companies])]
+
+    s = st.sidebar.text_input("Search PO # / Vendor / Part / Line contains", key="po_search")
+    if s:
+        cols = [c for c in ["Purchase Order #","Vendor","Part Number","Line Name"] if c in df.columns]
+        if cols:
+            m = pd.Series(False, index=df.index)
+            for c in cols:
+                m |= df[c].astype(str).str.contains(s, case=False, na=False)
+            df = df[m]
+
+    df = attach_row_key(df)
+    df_disp = df[[c for c in df.columns if c not in {"__KEY__","ID","id","Purchase Order ID"}]].copy()
+    st.dataframe(df_disp, use_container_width=True, hide_index=True, key="po_table")
+
+    st.download_button(
+        "⬇️ Download view (.xlsx)",
+        data=to_xlsx_bytes(df_disp, sheet="Outstanding_POs"),
+        file_name=f"Outstanding_POs_{(title_companies or 'all').replace(' ','_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_po_xlsx"
+    )
+
+# ========================= Quotes (simplified) =========================
+
+def next_quote_number(db_path: str, date_obj: datetime) -> str:
+    with sqlite3.connect(db_path, timeout=30, check_same_thread=False) as conn:
+        try:
             rows = conn.execute("SELECT quote_number FROM quotes WHERE quote_number LIKE ?", (f"QR-{date_obj:%Y}-%",)).fetchall()
-        used = set()
-        for (qn,) in rows:
-            try:
-                parts = str(qn).split("-"); seq = int(parts[-1])
-                if str(parts[1]) == f"{date_obj:%Y}": used.add(seq)
-            except Exception:
-                pass
-        seq = 1
-        while seq in used: seq += 1
-        return f"QR-{date_obj:%Y}-{seq:04d}"
+        except Exception:
+            rows = []
+    used = set()
+    for (qn,) in rows:
+        try:
+            parts = str(qn).split("-"); seq = int(parts[-1])
+            if str(parts[1]) == f"{date_obj:%Y}": used.add(seq)
+        except Exception:
+            pass
+    seq = 1
+    while seq in used: seq += 1
+    return f"QR-{date_obj:%Y}-{seq:04d}"
 
-    with sqlite3.connect(QUOTES_DB_PATH, timeout=30, check_same_thread=False) as conn:
+def ensure_quotes_table(db_path: str) -> None:
+    with sqlite3.connect(db_path, timeout=30, check_same_thread=False) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS quotes (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,15 +543,20 @@ else:
             )
         """); conn.commit()
 
+def quotes_page():
+    ensure_quotes_table(QUOTES_DB_PATH)
+    st.markdown(f"### Quotes — {title_companies}")
+
+    # New Quote
     st.subheader("New Quote")
     c1, c2 = st.columns([1,1])
     with c1:
-        company_new = st.selectbox("Location", options=(company_options or [""]), index=0)
-        vendor      = st.text_input("Vendor", value="")
-        quote_no    = st.text_input("Quote #", value=next_quote_number(QUOTES_DB_PATH, datetime.utcnow()))
+        company_new = st.selectbox("Location", options=(company_options or [""]), index=0, key="new_quote_location")
+        vendor      = st.text_input("Vendor", value="", key="new_quote_vendor")
+        quote_no    = st.text_input("Quote #", value=next_quote_number(QUOTES_DB_PATH, datetime.utcnow()), key="new_quote_no")
     with c2:
-        ship_to = st.text_area("Ship To", value="", height=120)
-        bill_to = st.text_area("Bill To", value="", height=120)
+        ship_to = st.text_area("Ship To", value="", height=120, key="new_quote_ship")
+        bill_to = st.text_area("Bill To", value="", height=120, key="new_quote_bill")
 
     lines = st.data_editor(
         pd.DataFrame([{"Part Number":"","Description":"","Quantity":"","Price/Unit":"","Total":""} for _ in range(12)]),
@@ -465,11 +567,12 @@ else:
             "Quantity":    st.column_config.NumberColumn("Qty", min_value=0, step=1),
             "Price/Unit":  st.column_config.TextColumn("Price/Unit"),
             "Total":       st.column_config.TextColumn("Total"),
-        }
+        },
+        key="new_quote_editor"
     )
 
     a1, a2, _ = st.columns([1,1,5])
-    if a1.button("Save Quote"):
+    if a1.button("Save Quote", key="btn_save_quote"):
         payload = json.dumps(lines.fillna("").astype(str).to_dict(orient="records"), ensure_ascii=False)
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(QUOTES_DB_PATH, timeout=30, check_same_thread=False) as conn:
@@ -477,14 +580,14 @@ else:
                 conn.execute("""
                     INSERT INTO quotes(quote_number, company, created_by, vendor, ship_to, bill_to,
                                        quote_date, status, source, lines_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, date('now'), ?, ?, ?, ?)
-                """, (quote_no, company_new, "user", vendor, ship_to, bill_to, "draft", "manual", payload, now))
+                    VALUES (?, ?, ?, ?, ?, ?, date('now'), 'draft', 'manual', ?, ?)
+                """, (quote_no, company_new, str(st.session_state.get("username", "")), vendor, ship_to, bill_to, payload, now))
                 conn.commit()
                 st.success(f"Saved quote {quote_no}")
             except sqlite3.IntegrityError:
                 st.error("Quote # already exists. Change number and try again.")
 
-    if a2.button("Download Word"):
+    if a2.button("Download Word", key="btn_dl_quote_word"):
         try:
             doc_bytes = build_quote_docx(
                 company=company_new, date_str=datetime.now().strftime("%Y-%m-%d"),
@@ -504,9 +607,24 @@ else:
     st.divider()
     st.subheader("Saved Quotes")
     with sqlite3.connect(QUOTES_DB_PATH, timeout=30, check_same_thread=False) as conn:
-        dfq = pd.read_sql_query(
-            "SELECT id, quote_number, quote_date, company, vendor, status, length(lines_json) AS bytes FROM quotes ORDER BY id DESC",
-            conn
-        )
-    st.dataframe(dfq, use_container_width=True, hide_index=True)
+        try:
+            dfq = pd.read_sql_query(
+                "SELECT id, quote_number, quote_date, company, vendor, status, length(lines_json) AS bytes FROM quotes ORDER BY id DESC",
+                conn
+            )
+        except Exception:
+            dfq = pd.DataFrame()
+    if dfq.empty:
+        st.info("No saved quotes yet.")
+    else:
+        st.dataframe(dfq, use_container_width=True, hide_index=True)
+
+# ========================= Router =========================
+
+if page == "RE-STOCK":
+    restock_page()
+elif page == "Outstanding POs":
+    po_outstanding_page()
+else:
+    quotes_page()
 
